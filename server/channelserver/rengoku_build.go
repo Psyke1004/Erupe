@@ -44,8 +44,8 @@ type RengokuConfig struct {
 // RoadConfig describes one road mode (multi or solo) with its floors and
 // spawn tables. Floors reference spawn tables by zero-based index.
 type RoadConfig struct {
-	Floors      []FloorConfig      `json:"floors"`
-	SpawnTables []SpawnTableConfig `json:"spawn_tables"`
+	Floors     []FloorConfig        `json:"floors"`
+	SpawnPools [][]SpawnTableConfig `json:"spawn_pools"`
 }
 
 // FloorConfig describes one floor within a road mode.
@@ -80,6 +80,15 @@ type SpawnTableConfig struct {
 // BuildRengokuBinary assembles a raw (unencrypted, uncompressed) rengoku
 // binary from a RengokuConfig. The result can be passed to EncodeECD and
 // served directly to clients.
+
+func sumSpawns(pools [][]SpawnTableConfig) uint32 {
+	var s uint32
+	for _, p := range pools {
+		s += uint32(len(p))
+	}
+	return s
+}
+
 func BuildRengokuBinary(cfg RengokuConfig) ([]byte, error) {
 	if err := validateRengokuConfig(cfg); err != nil {
 		return nil, err
@@ -93,21 +102,21 @@ func BuildRengokuBinary(cfg RengokuConfig) ([]byte, error) {
 	mFloorOff := dataStart
 	mFloorSz := uint32(len(cfg.MultiRoad.Floors)) * floorStatsByteSize
 	mPtrsOff := mFloorOff + mFloorSz
-	mPtrsSz := uint32(len(cfg.MultiRoad.SpawnTables)) * spawnPtrEntrySize
+	mPtrsSz := uint32(len(cfg.MultiRoad.SpawnPools)) * spawnPtrEntrySize
 	mCntOff := mPtrsOff + mPtrsSz
-	mCntSz := uint32(len(cfg.MultiRoad.SpawnTables)) * spawnPtrEntrySize
+	mCntSz := uint32(len(cfg.MultiRoad.SpawnPools)) * spawnPtrEntrySize
 	mTablesOff := mCntOff + mCntSz
-	mTablesSz := uint32(len(cfg.MultiRoad.SpawnTables)) * spawnTableByteSize
+	mTablesSz := sumSpawns(cfg.MultiRoad.SpawnPools) * spawnTableByteSize
 
 	// Solo road sections (appended directly after multi)
 	sFloorOff := mTablesOff + mTablesSz
 	sFloorSz := uint32(len(cfg.SoloRoad.Floors)) * floorStatsByteSize
 	sPtrsOff := sFloorOff + sFloorSz
-	sPtrsSz := uint32(len(cfg.SoloRoad.SpawnTables)) * spawnPtrEntrySize
+	sPtrsSz := uint32(len(cfg.SoloRoad.SpawnPools)) * spawnPtrEntrySize
 	sCntOff := sPtrsOff + sPtrsSz
-	sCntSz := uint32(len(cfg.SoloRoad.SpawnTables)) * spawnPtrEntrySize
+	sCntSz := uint32(len(cfg.SoloRoad.SpawnPools)) * spawnPtrEntrySize
 	sTablesOff := sCntOff + sCntSz
-	sTablesSz := uint32(len(cfg.SoloRoad.SpawnTables)) * spawnTableByteSize
+	sTablesSz := sumSpawns(cfg.SoloRoad.SpawnPools) * spawnTableByteSize
 
 	totalSize := sTablesOff + sTablesSz
 	buf := make([]byte, totalSize)
@@ -121,16 +130,16 @@ func BuildRengokuBinary(cfg RengokuConfig) ([]byte, error) {
 	// ── RoadMode structs ─────────────────────────────────────────────────────
 	writeRoadMode(buf, 0x14, le, RoadModeFields{
 		FloorCount:   uint32(len(cfg.MultiRoad.Floors)),
-		SpawnCount:   uint32(len(cfg.MultiRoad.SpawnTables)),
-		TablePtrCnt:  uint32(len(cfg.MultiRoad.SpawnTables)),
+		SpawnCount:   uint32(len(cfg.MultiRoad.SpawnPools)),
+		TablePtrCnt:  uint32(len(cfg.MultiRoad.SpawnPools)),
 		FloorPtr:     mFloorOff,
 		TablePtrsPtr: mPtrsOff,
 		CountPtrsPtr: mCntOff,
 	})
 	writeRoadMode(buf, 0x2C, le, RoadModeFields{
 		FloorCount:   uint32(len(cfg.SoloRoad.Floors)),
-		SpawnCount:   uint32(len(cfg.SoloRoad.SpawnTables)),
-		TablePtrCnt:  uint32(len(cfg.SoloRoad.SpawnTables)),
+		SpawnCount:   uint32(len(cfg.SoloRoad.SpawnPools)),
+		TablePtrCnt:  uint32(len(cfg.SoloRoad.SpawnPools)),
 		FloorPtr:     sFloorOff,
 		TablePtrsPtr: sPtrsOff,
 		CountPtrsPtr: sCntOff,
@@ -138,10 +147,10 @@ func BuildRengokuBinary(cfg RengokuConfig) ([]byte, error) {
 
 	// ── Data sections ────────────────────────────────────────────────────────
 	writeFloors(buf, cfg.MultiRoad.Floors, mFloorOff, le)
-	writeSpawnSection(buf, cfg.MultiRoad.SpawnTables, mPtrsOff, mTablesOff, le)
+	writeSpawnSection(buf, cfg.MultiRoad.SpawnPools, mPtrsOff, mCntOff, mTablesOff, le)
 
 	writeFloors(buf, cfg.SoloRoad.Floors, sFloorOff, le)
-	writeSpawnSection(buf, cfg.SoloRoad.SpawnTables, sPtrsOff, sTablesOff, le)
+	writeSpawnSection(buf, cfg.SoloRoad.SpawnPools, sPtrsOff, sCntOff, sTablesOff, le)
 
 	return buf, nil
 }
@@ -173,20 +182,25 @@ func writeFloors(buf []byte, floors []FloorConfig, base uint32, le binary.ByteOr
 	}
 }
 
-func writeSpawnSection(buf []byte, tables []SpawnTableConfig, ptrsBase, tablesBase uint32, le binary.ByteOrder) {
-	for i, t := range tables {
-		tableOff := tablesBase + uint32(i)*spawnTableByteSize
-		// Pointer entry
-		le.PutUint32(buf[ptrsBase+uint32(i)*spawnPtrEntrySize:], tableOff)
-		// SpawnTable (32 bytes)
-		le.PutUint32(buf[tableOff:], t.Monster1ID)
-		le.PutUint32(buf[tableOff+4:], t.Monster1Variant)
-		le.PutUint32(buf[tableOff+8:], t.Monster2ID)
-		le.PutUint32(buf[tableOff+12:], t.Monster2Variant)
-		le.PutUint32(buf[tableOff+16:], t.StatTable)
-		le.PutUint32(buf[tableOff+20:], t.MapZoneOverride)
-		le.PutUint32(buf[tableOff+24:], t.SpawnWeighting)
-		le.PutUint32(buf[tableOff+28:], t.AdditionalFlag)
+func writeSpawnSection(buf []byte, pools [][]SpawnTableConfig, ptrsBase, cntsBase, tablesBase uint32, le binary.ByteOrder) {
+	currentTableBase := tablesBase
+	for i, pool := range pools {
+		// Write the pointer and count for this pool
+		le.PutUint32(buf[ptrsBase+uint32(i)*4:], currentTableBase)
+		le.PutUint32(buf[cntsBase+uint32(i)*4:], uint32(len(pool)))
+
+		// Write the actual spawn tables inside this pool
+		for _, t := range pool {
+			le.PutUint32(buf[currentTableBase:], t.Monster1ID)
+			le.PutUint32(buf[currentTableBase+4:], t.Monster1Variant)
+			le.PutUint32(buf[currentTableBase+8:], t.Monster2ID)
+			le.PutUint32(buf[currentTableBase+12:], t.Monster2Variant)
+			le.PutUint32(buf[currentTableBase+16:], t.StatTable)
+			le.PutUint32(buf[currentTableBase+20:], t.MapZoneOverride)
+			le.PutUint32(buf[currentTableBase+24:], t.SpawnWeighting)
+			le.PutUint32(buf[currentTableBase+28:], t.AdditionalFlag)
+			currentTableBase += spawnTableByteSize
+		}
 	}
 }
 
@@ -197,10 +211,10 @@ func validateRengokuConfig(cfg RengokuConfig) error {
 		name string
 		r    RoadConfig
 	}{{"multi_road", cfg.MultiRoad}, {"solo_road", cfg.SoloRoad}} {
-		n := len(road.r.SpawnTables)
+		n := len(road.r.SpawnPools)
 		for i, f := range road.r.Floors {
 			if int(f.SpawnTableIndex) >= n {
-				return fmt.Errorf("rengoku: %s floor %d: spawn_table_index %d out of range (have %d tables)",
+				return fmt.Errorf("rengoku: %s floor %d: spawn_table_index %d out of range (have %d pools)",
 					road.name, i, f.SpawnTableIndex, n)
 			}
 		}
@@ -252,6 +266,9 @@ func loadRengokuFromJSON(binPath string, logger *zap.Logger) []byte {
 			zap.String("path", path), zap.Error(parseErr))
 		return nil
 	}
+
+	// Compress the raw binary with JKR Type 3 before encrypting
+	bin = decryption.PackSimple(bin)
 
 	enc, err := encodeRengokuECD(bin, logger)
 	if err != nil {

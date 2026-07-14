@@ -146,11 +146,13 @@ func validateRoadMode(data []byte, rm rengokuRoadMode, label string) error {
 
 	// Individual spawn-table pointer targets.
 	ptrBase := rm.SpawnTablePtrsPtr
+	cntBase := rm.SpawnCountPtrsPtr
 	for i := uint32(0); i < rm.SpawnTablePtrCount; i++ {
 		tablePtr := binary.LittleEndian.Uint32(data[ptrBase+i*4:])
-		if !ptrInBounds(data, tablePtr, spawnTableByteSize) {
-			return fmt.Errorf("rengoku: %s: spawnTable[%d] at 0x%X is out of bounds (file %d B)",
-				label, i, tablePtr, fileLen)
+		count := binary.LittleEndian.Uint32(data[cntBase+i*4:])
+		if !ptrInBounds(data, tablePtr, count*spawnTableByteSize) {
+			return fmt.Errorf("rengoku: %s: spawnPool[%d] at 0x%X (count %d) is out of bounds (file %d B)",
+				label, i, tablePtr, count, fileLen)
 		}
 	}
 
@@ -162,19 +164,24 @@ func validateRoadMode(data []byte, rm rengokuRoadMode, label string) error {
 func countUniqueMonsters(data []byte, rm rengokuRoadMode) map[uint32]struct{} {
 	ids := make(map[uint32]struct{})
 	ptrBase := rm.SpawnTablePtrsPtr
+	cntBase := rm.SpawnCountPtrsPtr
 	for i := uint32(0); i < rm.SpawnTablePtrCount; i++ {
 		tablePtr := binary.LittleEndian.Uint32(data[ptrBase+i*4:])
-		if !ptrInBounds(data, tablePtr, spawnTableByteSize) {
+		count := binary.LittleEndian.Uint32(data[cntBase+i*4:])
+		if !ptrInBounds(data, tablePtr, count*spawnTableByteSize) {
 			continue
 		}
-		t := data[tablePtr:]
-		id1 := binary.LittleEndian.Uint32(t[0:])
-		id2 := binary.LittleEndian.Uint32(t[8:])
-		if id1 != 0 {
-			ids[id1] = struct{}{}
-		}
-		if id2 != 0 {
-			ids[id2] = struct{}{}
+
+		for j := uint32(0); j < count; j++ {
+			t := data[tablePtr+j*spawnTableByteSize:]
+			id1 := binary.LittleEndian.Uint32(t[0:])
+			id2 := binary.LittleEndian.Uint32(t[8:])
+			if id1 != 0 {
+				ids[id1] = struct{}{}
+			}
+			if id2 != 0 {
+				ids[id2] = struct{}{}
+			}
 		}
 	}
 	return ids

@@ -13,11 +13,13 @@ import (
 
 // sampleRengokuConfig returns a small but complete RengokuConfig for tests.
 func sampleRengokuConfig() RengokuConfig {
-	spawnTables := []SpawnTableConfig{
-		{Monster1ID: 101, Monster1Variant: 0, Monster2ID: 102, Monster2Variant: 1,
-			StatTable: 3, SpawnWeighting: 10},
-		{Monster1ID: 103, Monster1Variant: 2, Monster2ID: 104, Monster2Variant: 0,
-			SpawnWeighting: 20},
+	spawnPools := [][]SpawnTableConfig{
+		{
+			{Monster1ID: 101, Monster1Variant: 0, Monster2ID: 102, Monster2Variant: 1, StatTable: 3, SpawnWeighting: 10},
+		},
+		{
+			{Monster1ID: 103, Monster1Variant: 2, Monster2ID: 104, Monster2Variant: 0, SpawnWeighting: 20},
+		},
 	}
 	floors := []FloorConfig{
 		{FloorNumber: 1, SpawnTableIndex: 0, PointMulti1: 1.0, PointMulti2: 1.5},
@@ -29,8 +31,8 @@ func sampleRengokuConfig() RengokuConfig {
 		{FloorNumber: 2, SpawnTableIndex: 0, PointMulti1: 1.2, PointMulti2: 2.0},
 	}
 	return RengokuConfig{
-		MultiRoad: RoadConfig{Floors: floors, SpawnTables: spawnTables},
-		SoloRoad:  RoadConfig{Floors: soloFloors, SpawnTables: spawnTables[1:]},
+		MultiRoad: RoadConfig{Floors: floors, SpawnPools: spawnPools},
+		SoloRoad:  RoadConfig{Floors: soloFloors, SpawnPools: spawnPools[1:]},
 	}
 }
 
@@ -52,14 +54,14 @@ func TestBuildRengokuBinary_RoundTrip(t *testing.T) {
 	if info.MultiFloors != len(cfg.MultiRoad.Floors) {
 		t.Errorf("MultiFloors = %d, want %d", info.MultiFloors, len(cfg.MultiRoad.Floors))
 	}
-	if info.MultiSpawnTables != len(cfg.MultiRoad.SpawnTables) {
-		t.Errorf("MultiSpawnTables = %d, want %d", info.MultiSpawnTables, len(cfg.MultiRoad.SpawnTables))
+	if info.MultiSpawnTables != len(cfg.MultiRoad.SpawnPools) {
+		t.Errorf("MultiSpawnTables = %d, want %d", info.MultiSpawnTables, len(cfg.MultiRoad.SpawnPools))
 	}
 	if info.SoloFloors != len(cfg.SoloRoad.Floors) {
 		t.Errorf("SoloFloors = %d, want %d", info.SoloFloors, len(cfg.SoloRoad.Floors))
 	}
-	if info.SoloSpawnTables != len(cfg.SoloRoad.SpawnTables) {
-		t.Errorf("SoloSpawnTables = %d, want %d", info.SoloSpawnTables, len(cfg.SoloRoad.SpawnTables))
+	if info.SoloSpawnTables != len(cfg.SoloRoad.SpawnPools) {
+		t.Errorf("SoloSpawnTables = %d, want %d", info.SoloSpawnTables, len(cfg.SoloRoad.SpawnPools))
 	}
 	// Unique monsters: multi has 101,102,103,104; solo has 103,104 → 4 total
 	if info.UniqueMonsters != 4 {
@@ -75,11 +77,11 @@ func TestBuildRengokuBinary_FloatFields(t *testing.T) {
 			Floors: []FloorConfig{
 				{FloorNumber: 1, SpawnTableIndex: 0, PointMulti1: 1.25, PointMulti2: 3.75},
 			},
-			SpawnTables: []SpawnTableConfig{{Monster1ID: 1}},
+			SpawnPools: [][]SpawnTableConfig{{{Monster1ID: 1}}},
 		},
 		SoloRoad: RoadConfig{
-			Floors:      []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 0}},
-			SpawnTables: []SpawnTableConfig{{Monster1ID: 2}},
+			Floors:     []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 0}},
+			SpawnPools: [][]SpawnTableConfig{{{Monster1ID: 2}}},
 		},
 	}
 
@@ -117,12 +119,12 @@ func TestBuildRengokuBinary_ValidationErrors(t *testing.T) {
 			name: "multi_index_out_of_range",
 			cfg: RengokuConfig{
 				MultiRoad: RoadConfig{
-					Floors:      []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 5}},
-					SpawnTables: []SpawnTableConfig{{Monster1ID: 1}},
+					Floors:     []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 5}},
+					SpawnPools: [][]SpawnTableConfig{{{Monster1ID: 1}}},
 				},
 				SoloRoad: RoadConfig{
-					Floors:      []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 0}},
-					SpawnTables: []SpawnTableConfig{{Monster1ID: 2}},
+					Floors:     []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 0}},
+					SpawnPools: [][]SpawnTableConfig{{{Monster1ID: 2}}},
 				},
 			},
 			wantErr: "multi_road",
@@ -131,12 +133,12 @@ func TestBuildRengokuBinary_ValidationErrors(t *testing.T) {
 			name: "solo_index_out_of_range",
 			cfg: RengokuConfig{
 				MultiRoad: RoadConfig{
-					Floors:      []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 0}},
-					SpawnTables: []SpawnTableConfig{{Monster1ID: 1}},
+					Floors:     []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 0}},
+					SpawnPools: [][]SpawnTableConfig{{{Monster1ID: 1}}},
 				},
 				SoloRoad: RoadConfig{
-					Floors:      []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 99}},
-					SpawnTables: []SpawnTableConfig{{Monster1ID: 2}},
+					Floors:     []FloorConfig{{FloorNumber: 1, SpawnTableIndex: 99}},
+					SpawnPools: [][]SpawnTableConfig{{{Monster1ID: 2}}},
 				},
 			},
 			wantErr: "solo_road",
