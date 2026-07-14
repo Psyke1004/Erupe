@@ -4,6 +4,9 @@ www/jp/
 vendor/
 *.bin
 savedata/*/
+# Local quest/rengoku JSON data (edit sources & backups, not part of the codebase)
+bin/*.json
+bin/**/*.json
 *.exe
 *.lnk
 *.bat

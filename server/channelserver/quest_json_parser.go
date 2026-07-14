@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"reflect"
 
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
@@ -67,6 +68,11 @@ func ParseQuestBinary(data []byte) (*QuestJSON, error) {
 	}
 
 	q := &QuestJSON{}
+
+	// Preserve the original binary so CompileQuestJSON can patch edits back
+	// onto it (template mode) instead of rebuilding the lossy sections.
+	q.RawTemplateData = make([]byte, len(data))
+	copy(q.RawTemplateData, data)
 
 	// ── Header (0x00–0x43) ───────────────────────────────────────────────
 	questTypeFlagsPtr := int(u32(0x00))
@@ -335,7 +341,34 @@ func ParseQuestBinary(data []byte) (*QuestJSON, error) {
 		q.GatheringTables = tables
 	}
 
+	// Replace any NaN floats (from garbage/padding bytes) so the struct
+	// marshals to valid JSON.
+	fixNaNs(reflect.ValueOf(q))
+
 	return q, nil
+}
+
+// fixNaNs recursively walks a reflect.Value and replaces any NaN float with 0,
+// preventing JSON marshaling errors on binaries whose padding decodes to NaN.
+func fixNaNs(v reflect.Value) {
+	switch v.Kind() {
+	case reflect.Ptr:
+		if !v.IsNil() {
+			fixNaNs(v.Elem())
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			fixNaNs(v.Field(i))
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			fixNaNs(v.Index(i))
+		}
+	case reflect.Float32, reflect.Float64:
+		if v.CanSet() && math.IsNaN(v.Float()) {
+			v.SetFloat(0)
+		}
+	}
 }
 
 // ── Section parsers ──────────────────────────────────────────────────────────

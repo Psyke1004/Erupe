@@ -305,6 +305,14 @@ type QuestJSON struct {
 
 	// Gathering loot tables (gatheringTablesPtr)
 	GatheringTables []QuestGatheringTableJSON `json:"gathering_tables,omitempty"`
+
+	// RawTemplateData holds the original quest binary this JSON was parsed
+	// from. When present, CompileQuestJSON patches edited scalar/text fields
+	// onto this template instead of rebuilding from scratch, preserving the
+	// crash-critical sections (fixedCoords2/fixedInfo, generalQuestProperties
+	// padding) that the full-rebuild path cannot reproduce. Omitted for
+	// hand-authored quests, which take the full-rebuild path.
+	RawTemplateData []byte `json:"raw_template_data,omitempty"`
 }
 
 // toShiftJIS converts a UTF-8 string to a null-terminated Shift-JIS byte slice.
@@ -434,6 +442,18 @@ func CompileQuestJSON(data []byte, lang string) ([]byte, error) {
 	var q QuestJSON
 	if err := json.Unmarshal(data, &q); err != nil {
 		return nil, fmt.Errorf("parse quest JSON: %w", err)
+	}
+
+	// Template mode: if the JSON carries its original binary, patch the edited
+	// fields onto it rather than rebuilding. The full-rebuild path below cannot
+	// reproduce every section a client dereferences at runtime, so quests meant
+	// to run in-game must round-trip through their preserved template.
+	if len(q.RawTemplateData) > 0 {
+		present, err := jsonFieldSet(data)
+		if err != nil {
+			return nil, err
+		}
+		return packQuestTemplate(q.RawTemplateData, &q, lang, present)
 	}
 
 	// ── Compute counts before writing generalQuestProperties ─────────────
@@ -1153,4 +1173,228 @@ func buildMonsterSpawns(monsters []QuestMonsterJSON, basePtr uint32) ([]byte, er
 		pad(buf, 16)                      // +0x2C padding[0x10]
 	}
 	return buf.Bytes(), nil
+}
+
+// ── Template-mode compilation ───────────────────────────────────────────────
+//
+// When a quest JSON carries raw_template_data (populated by ParseQuestBinary),
+// CompileQuestJSON patches the edited fields onto the original binary instead
+// of rebuilding it. Variable-length sections (monster spawns, reward tables,
+// stages, gathering data) keep their template bytes — relocating them would
+// mean rebuilding every header pointer, which is exactly what the full-rebuild
+// path already does for hand-authored JSON. Only fixed-width scalar fields and
+// the eight quest texts are patched.
+
+// jsonFieldSet returns the set of top-level keys present in a quest JSON
+// document. Template packing uses it to distinguish "field set to zero" from
+// "field omitted", so an omitted field leaves the template value intact.
+func jsonFieldSet(data []byte) (map[string]bool, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse quest JSON field set: %w", err)
+	}
+	present := make(map[string]bool, len(raw))
+	for k := range raw {
+		present[k] = true
+	}
+	return present, nil
+}
+
+// templatePatcher writes fixed-width values into a quest template, skipping any
+// field absent from the source JSON. A nil present map patches every field.
+type templatePatcher struct {
+	bin     []byte
+	present map[string]bool
+}
+
+func (p *templatePatcher) has(field string) bool {
+	return p.present == nil || p.present[field]
+}
+
+func (p *templatePatcher) u8(off int, field string, v uint8) {
+	if p.has(field) && off < len(p.bin) {
+		p.bin[off] = v
+	}
+}
+
+func (p *templatePatcher) u16(off int, field string, v uint16) {
+	if p.has(field) && off+2 <= len(p.bin) {
+		binary.LittleEndian.PutUint16(p.bin[off:], v)
+	}
+}
+
+func (p *templatePatcher) u32(off int, field string, v uint32) {
+	if p.has(field) && off+4 <= len(p.bin) {
+		binary.LittleEndian.PutUint32(p.bin[off:], v)
+	}
+}
+
+func (p *templatePatcher) bytes(off int, field string, v []byte) {
+	if p.has(field) && off+len(v) <= len(p.bin) {
+		copy(p.bin[off:], v)
+	}
+}
+
+// patchTemplateFields overwrites the fixed-width scalar fields of a quest
+// template in place, using the values from the JSON document.
+func patchTemplateFields(bin []byte, q *QuestJSON, present map[string]bool) error {
+	mp := int(binary.LittleEndian.Uint32(bin[0x00:]))
+	if mp == 0 || mp+questBodyLenZZ > len(bin) {
+		return fmt.Errorf("template mainQuestProperties out of range (ptr=0x%X, size=%d)", mp, len(bin))
+	}
+
+	p := &templatePatcher{bin: bin, present: present}
+
+	// generalQuestProperties (fixed at 0x44)
+	p.u16(0x44, "monster_size_multi", q.MonsterSizeMulti)
+	p.u16(0x46, "size_range", q.SizeRange)
+	p.u32(0x48, "stat_table_1", q.StatTable1)
+	p.u32(0x4C, "main_rank_points", q.MainRankPoints)
+	p.u32(0x54, "sub_a_rank_points", q.SubARankPoints)
+	p.u32(0x58, "sub_b_rank_points", q.SubBRankPoints)
+	p.u8(0x61, "stat_table_2", q.StatTable2)
+
+	// mainQuestProperties. questStringsPtr (+0x28) is owned by the text
+	// rewriter in packQuestTemplate and must not be touched here.
+	p.u16(mp+0x08, "rank_band", q.RankBand)
+	p.u32(mp+0x0C, "fee", q.Fee)
+	p.u32(mp+0x10, "reward_main", q.RewardMain)
+	p.u16(mp+0x18, "reward_sub_a", q.RewardSubA)
+	p.u16(mp+0x1C, "reward_sub_b", q.RewardSubB)
+	p.u16(mp+0x1E, "hard_hr_req", q.HardHRReq)
+	p.u32(mp+0x20, "time_limit_minutes", q.TimeLimitMinutes*60*30) // frames at 30Hz
+	p.u32(mp+0x24, "map", q.Map)
+	p.u16(mp+0x2E, "quest_id", q.QuestID)
+
+	// +0x30 objectives[3], 8 bytes each
+	objFields := [3]string{"objective_main", "objective_sub_a", "objective_sub_b"}
+	objValues := [3]QuestObjectiveJSON{q.ObjectiveMain, q.ObjectiveSubA, q.ObjectiveSubB}
+	for i, field := range objFields {
+		if !p.has(field) {
+			continue
+		}
+		b, err := objectiveBytes(objValues[i])
+		if err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
+		p.bytes(mp+0x30+i*8, field, b)
+	}
+
+	p.u16(mp+0x4C, "join_rank_min", q.JoinRankMin)
+	p.u16(mp+0x4E, "join_rank_max", q.JoinRankMax)
+	p.u16(mp+0x50, "post_rank_min", q.PostRankMin)
+	p.u16(mp+0x52, "post_rank_max", q.PostRankMax)
+
+	// +0x5C forced equipment (6 slots × 4 u16 = 48 bytes)
+	if p.has("forced_equipment") && q.ForcedEquipment != nil {
+		eq := q.ForcedEquipment
+		buf := &bytes.Buffer{}
+		for _, slot := range [][4]uint16{eq.Legs, eq.Weapon, eq.Head, eq.Chest, eq.Arms, eq.Waist} {
+			for _, v := range slot {
+				writeUint16LE(buf, v)
+			}
+		}
+		p.bytes(mp+0x5C, "forced_equipment", buf.Bytes())
+	}
+
+	p.u8(mp+0x97, "quest_variant1", q.QuestVariant1)
+	p.u8(mp+0x98, "quest_variant2", q.QuestVariant2)
+	p.u8(mp+0x99, "quest_variant3", q.QuestVariant3)
+	p.u8(mp+0x9A, "quest_variant4", q.QuestVariant4)
+
+	return nil
+}
+
+// PackQuestTemplate patches a quest JSON document onto its original binary
+// template, applying every field the format supports. Intended for offline
+// tooling that bakes edited JSON back into runnable binaries.
+func PackQuestTemplate(original []byte, q *QuestJSON, lang string) ([]byte, error) {
+	return packQuestTemplate(original, q, lang, nil)
+}
+
+// packQuestTemplate patches only the fields named in present onto a copy of the
+// original binary; a nil map means "patch everything". Scalars are written in
+// place; the eight quest texts are appended and repointed only if they changed.
+func packQuestTemplate(original []byte, q *QuestJSON, lang string, present map[string]bool) ([]byte, error) {
+	if len(original) < 0x62 {
+		return nil, fmt.Errorf("quest template too small (%d bytes)", len(original))
+	}
+
+	bin := make([]byte, len(original))
+	copy(bin, original)
+
+	if err := patchTemplateFields(bin, q, present); err != nil {
+		return nil, err
+	}
+
+	// Quest texts in QuestText order: title, textMain, textSubA, textSubB,
+	// successCond, failCond, contractor, description.
+	rawTexts := []string{
+		q.Title.Resolve(lang), q.TextMain.Resolve(lang),
+		q.TextSubA.Resolve(lang), q.TextSubB.Resolve(lang),
+		q.SuccessCond.Resolve(lang), q.FailCond.Resolve(lang),
+		q.Contractor.Resolve(lang), q.Description.Resolve(lang),
+	}
+
+	// Locate the string-pointer array (questStringsPtr at questTypeFlagsPtr+0x28).
+	questTypeFlagsPtr := int(binary.LittleEndian.Uint32(bin[0x00:]))
+	if questTypeFlagsPtr+0x2C > len(bin) {
+		return bin, nil
+	}
+	stringsArrayPtr := int(binary.LittleEndian.Uint32(bin[questTypeFlagsPtr+0x28:]))
+	if stringsArrayPtr == 0 || stringsArrayPtr+32 > len(bin) {
+		return bin, nil
+	}
+
+	// Encode each text once (with trailing NUL); reuse for compare and append.
+	encoded := make([][]byte, len(rawTexts))
+	for i, txt := range rawTexts {
+		sjis, err := toShiftJIS(txt)
+		if err != nil {
+			return nil, err
+		}
+		encoded[i] = sjis
+	}
+
+	// Only rewrite the string table if some text actually changed.
+	changed := false
+	for i := range encoded {
+		ptr := int(binary.LittleEndian.Uint32(bin[stringsArrayPtr+i*4:]))
+		orig := readNullTerminated(bin, ptr)
+		if !bytes.Equal(orig, encoded[i][:len(encoded[i])-1]) { // encoded has trailing NUL
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return bin, nil
+	}
+
+	// Append the new strings and repoint the eight pointers at them. The old
+	// string bytes become dead space; the client reads strings via pointers.
+	var appended []byte
+	offsets := make([]int, len(encoded))
+	for i, sjis := range encoded {
+		offsets[i] = len(bin) + len(appended)
+		appended = append(appended, sjis...)
+	}
+	bin = append(bin, appended...)
+	for i := 0; i < 8; i++ {
+		binary.LittleEndian.PutUint32(bin[stringsArrayPtr+i*4:], uint32(offsets[i]))
+	}
+
+	return bin, nil
+}
+
+// readNullTerminated reads bytes from data starting at off until a 0x00 byte,
+// returning the run without the terminator. Returns nil on an out-of-range off.
+func readNullTerminated(data []byte, off int) []byte {
+	if off <= 0 || off >= len(data) {
+		return nil
+	}
+	end := off
+	for end < len(data) && data[end] != 0 {
+		end++
+	}
+	return data[off:end]
 }

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ParseQuestBinary` now preserves the source binary on the parsed struct (`raw_template_data`), and `CompileQuestJSON` uses it as a template: edited scalar/text fields are patched onto the original bytes instead of rebuilt from scratch. The full-rebuild path can't reproduce every section a client dereferences at runtime (fixedCoords2/fixedInfo, generalQuestProperties padding), so retail quests edited via JSON round-trip byte-identically when unchanged and stay runnable in-game when edited. Hand-authored JSON (no `raw_template_data`) still takes the full-rebuild path.
 - Rengoku (Hunting Road) build now models each floor's spawn slot as a *pool* of spawn tables (`spawn_pools: [][]SpawnTableConfig`) with a per-pool count, replacing the flat one-table-per-slot `spawn_tables`, and JKR-compresses the assembled binary before ECD encryption to match the retail container.
 - `DebugOptions.QuestTools`'s `MSG_SYS_CAST_BINARY` quest-payload logging now also dumps the full raw hex (plus sender char ID) alongside the existing best-effort XYZ decode, so the real struct layout can be read directly instead of guessed. Used this to confirm the payload bundles one position record per party slot (player + AI companions), each tagged with an incrementing slot ID — the existing fixed-offset decode was only ever reading slot 1.
 
