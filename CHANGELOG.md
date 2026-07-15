@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rengoku (Hunting Road) build now models each floor's spawn slot as a *pool* of spawn tables (`spawn_pools: [][]SpawnTableConfig`) with a per-pool count, replacing the flat one-table-per-slot `spawn_tables`, and JKR-compresses the assembled binary before ECD encryption to match the retail container.
 - `DebugOptions.QuestTools`'s `MSG_SYS_CAST_BINARY` quest-payload logging now also dumps the full raw hex (plus sender char ID) alongside the existing best-effort XYZ decode, so the real struct layout can be read directly instead of guessed. Used this to confirm the payload bundles one position record per party slot (player + AI companions), each tagged with an incrementing slot ID — the existing fixed-offset decode was only ever reading slot 1.
 
+### Removed
+
+- Orphaned `schemas/bundled-schema/` directory, superseded by `server/migrations/seed/` and drifted out of sync with it; also its dead volume mount in `docker/docker-compose.test.yml`.
+- Orphaned root-level `savedata/` placeholder directory (unused by any code path); also its `cp` step in `release.yml` and its `.gitignore` rule.
+- Stale `www/` references (`.gitignore`, `Dockerfile` comment, CI artifact upload) left over from the removed LauncherServer, plus the never-present `config.json` from the same CI artifact list.
+
 ### Fixed
 
 - `DebugOptions.QuestTools`'s `Coord` debug line blindly read a fixed offset (20) of the `MSG_SYS_CAST_BINARY` quest payload regardless of what was actually there, silently aliasing a different entity's own position field whenever the payload wasn't a plain party-slot message. Now locates party slot 1's record explicitly by its own ID tag before decoding XYZ from it.
