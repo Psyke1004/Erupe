@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `packQuestTemplate` rewrote all eight quest-text pointers whenever any re-encoded string differed byte-wise from the original, but some retail Shift-JIS characters have more than one valid encoding, so unchanged text was constantly detected as "edited" and relocated. Texts are now compared after decoding, and only fields actually present in the JSON and actually changed get appended and repointed.
+- `patchTemplateFields` overwrote an objective slot even when the JSON said `none` and the slot was already `questObjNone` in the original binary, clobbering the opaque target/count bytes retail leaves in inactive slots.
+
 ### Removed
 
 - `stable/v9.2.x` branch and its `SECURITY.md` supported-version entry — the branch had been untouched since 2026-02-08 and 9.2.x is well past the current 9.4.x release line.

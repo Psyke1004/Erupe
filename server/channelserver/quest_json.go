@@ -1273,11 +1273,16 @@ func patchTemplateFields(bin []byte, q *QuestJSON, present map[string]bool) erro
 		if !p.has(field) {
 			continue
 		}
+		off := mp + 0x30 + i*8
+		// Preserve opaque target/count bytes in an already-inactive retail slot.
+		if objValues[i].Type == "none" && binary.LittleEndian.Uint32(bin[off:]) == questObjNone {
+			continue
+		}
 		b, err := objectiveBytes(objValues[i])
 		if err != nil {
 			return fmt.Errorf("%s: %w", field, err)
 		}
-		p.bytes(mp+0x30+i*8, field, b)
+		p.bytes(off, field, b)
 	}
 
 	p.u16(mp+0x4C, "join_rank_min", q.JoinRankMin)
@@ -1346,41 +1351,31 @@ func packQuestTemplate(original []byte, q *QuestJSON, lang string, present map[s
 		return bin, nil
 	}
 
-	// Encode each text once (with trailing NUL); reuse for compare and append.
-	encoded := make([][]byte, len(rawTexts))
+	textFields := [...]string{
+		"title", "text_main", "text_sub_a", "text_sub_b",
+		"success_cond", "fail_cond", "contractor", "description",
+	}
+
+	// Compare text semantically instead of comparing re-encoded bytes. Some
+	// retail Shift-JIS extension characters have multiple byte encodings. Keep
+	// untouched strings at their original pointers and append only edited ones.
 	for i, txt := range rawTexts {
+		if present != nil && !present[textFields[i]] {
+			continue
+		}
+		ptr := int(binary.LittleEndian.Uint32(bin[stringsArrayPtr+i*4:]))
+		orig := readNullTerminated(bin, ptr)
+		decoded, _, err := transform.Bytes(japanese.ShiftJIS.NewDecoder(), orig)
+		if err == nil && string(decoded) == txt {
+			continue
+		}
 		sjis, err := toShiftJIS(txt)
 		if err != nil {
 			return nil, err
 		}
-		encoded[i] = sjis
-	}
-
-	// Only rewrite the string table if some text actually changed.
-	changed := false
-	for i := range encoded {
-		ptr := int(binary.LittleEndian.Uint32(bin[stringsArrayPtr+i*4:]))
-		orig := readNullTerminated(bin, ptr)
-		if !bytes.Equal(orig, encoded[i][:len(encoded[i])-1]) { // encoded has trailing NUL
-			changed = true
-			break
-		}
-	}
-	if !changed {
-		return bin, nil
-	}
-
-	// Append the new strings and repoint the eight pointers at them. The old
-	// string bytes become dead space; the client reads strings via pointers.
-	var appended []byte
-	offsets := make([]int, len(encoded))
-	for i, sjis := range encoded {
-		offsets[i] = len(bin) + len(appended)
-		appended = append(appended, sjis...)
-	}
-	bin = append(bin, appended...)
-	for i := 0; i < 8; i++ {
-		binary.LittleEndian.PutUint32(bin[stringsArrayPtr+i*4:], uint32(offsets[i]))
+		newPtr := len(bin)
+		bin = append(bin, sjis...)
+		binary.LittleEndian.PutUint32(bin[stringsArrayPtr+i*4:], uint32(newPtr))
 	}
 
 	return bin, nil
