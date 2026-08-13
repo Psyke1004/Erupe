@@ -78,6 +78,10 @@ type Session struct {
 	// currentBeadIndex is the bead slot selected by the player via MsgMhfSetKiju.
 	// A value of -1 means no bead is currently assigned this session.
 	currentBeadIndex int
+	// lastDivaPointAck suppresses a retransmission of the same acknowledged
+	// Diva point packet within this connection.
+	lastDivaPointAck    uint32
+	hasLastDivaPointAck bool
 
 	Name           string
 	closed         atomic.Bool

@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `packQuestTemplate` rewrote all eight quest-text pointers whenever any re-encoded string differed byte-wise from the original, but some retail Shift-JIS characters have more than one valid encoding, so unchanged text was constantly detected as "edited" and relocated. Texts are now compared after decoding, and only fields actually present in the JSON and actually changed get appended and repointed.
 - `patchTemplateFields` overwrote an objective slot even when the JSON said `none` and the slot was already `questObjNone` in the original binary, clobbering the opaque target/count bytes retail leaves in inactive slots.
+- `0026_diva_fixes.sql` adds a unique index on `diva_beads_assignment (character_id)` — the table had no unique key at all, so `AssignBead`'s bare `ON CONFLICT DO NOTHING` could only ever suppress a serial-primary-key conflict and every bead change appended a row instead of replacing the selection — collapsing any existing rows to the newest per character first.
+- `AssignBead` now upserts on `character_id`, updating both `bead_index` and `expiry`, so selecting another bead replaces the character's active selection instead of accumulating rows or retaining the first selection after migration 0026.
+- `0026_diva_fixes.sql` adds a nullable `event_id` and supporting indexes to `diva_beads_points` as schema groundwork for event-scoped colour totals; rows predating the migration are attributed only when exactly one Diva event exists, while runtime writes and reads remain unscoped until the planned R3/R4 changes.
 
 ### Removed
 

@@ -419,12 +419,16 @@ func handleMsgMhfOperateWarehouse(s *Session, p mhfpacket.MHFPacket) {
 }
 
 func addWarehouseItem(s *Session, item mhfitem.MHFItemStack) {
+	if err := addWarehouseItemChecked(s, item); err != nil {
+		s.logger.Error("Failed to update warehouse gift box", zap.Error(err))
+	}
+}
+
+func addWarehouseItemChecked(s *Session, item mhfitem.MHFItemStack) error {
 	giftBox := warehouseGetItems(s, 10)
 	item.WarehouseID = token.RNG.Uint32()
 	giftBox = append(giftBox, item)
-	if err := s.server.houseRepo.SetWarehouseItemData(s.charID, 10, mhfitem.SerializeWarehouseItems(giftBox)); err != nil {
-		s.logger.Error("Failed to update warehouse gift box", zap.Error(err))
-	}
+	return s.server.houseRepo.SetWarehouseItemData(s.charID, 10, mhfitem.SerializeWarehouseItems(giftBox))
 }
 
 func warehouseGetItems(s *Session, index uint8) []mhfitem.MHFItemStack {

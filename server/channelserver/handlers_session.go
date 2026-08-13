@@ -2,7 +2,9 @@ package channelserver
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
+	"errors"
 	"erupe-ce/common/byteframe"
 	"erupe-ce/common/mhfcourse"
 	"erupe-ce/common/mhfmon"
@@ -33,6 +35,20 @@ func handleMsgSysNop(s *Session, p mhfpacket.MHFPacket) {
 }
 
 func handleMsgSysAck(s *Session, p mhfpacket.MHFPacket) {} // stub: unimplemented
+
+func restoreDivaBeadSelection(s *Session) {
+	s.currentBeadIndex = -1
+	beadIndex, err := s.server.divaRepo.GetAssignedBead(s.charID, TimeAdjusted())
+	if err == nil {
+		s.currentBeadIndex = beadIndex
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		s.logger.Warn("Failed to restore Diva bead selection",
+			zap.Error(err),
+			zap.Uint32("charID", s.charID))
+	}
+}
 
 func handleMsgSysTerminalLog(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgSysTerminalLog)

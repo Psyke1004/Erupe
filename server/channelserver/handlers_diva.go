@@ -1,9 +1,10 @@
 package channelserver
 
 import (
-	"encoding/hex"
 	"erupe-ce/common/stringsupport"
 	cfg "erupe-ce/config"
+	"fmt"
+	"sort"
 	"time"
 
 	"erupe-ce/common/byteframe"
@@ -143,6 +144,19 @@ func handleMsgMhfGetUdInfo(s *Session, p mhfpacket.MHFPacket) {
 // defaultBeadTypes are used when the database has no bead rows configured.
 var defaultBeadTypes = []int{1, 3, 4, 8}
 
+const maxDivaBeadSlots = 4
+
+func getDivaBeadTypes(repo DivaRepo) []int {
+	beadTypes, err := repo.GetBeads()
+	if err != nil || len(beadTypes) == 0 {
+		beadTypes = defaultBeadTypes
+	}
+	if len(beadTypes) > maxDivaBeadSlots {
+		beadTypes = beadTypes[:maxDivaBeadSlots]
+	}
+	return beadTypes
+}
+
 func handleMsgMhfGetKijuInfo(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetKijuInfo)
 
@@ -152,10 +166,7 @@ func handleMsgMhfGetKijuInfo(s *Session, p mhfpacket.MHFPacket) {
 	//   +0x220 u8        color_id  (slot index, 1-based)
 	//   +0x221 u8        bead_type (effect ID)
 	// Response: u8 count + count × 546 bytes.
-	beadTypes, err := s.server.divaRepo.GetBeads()
-	if err != nil || len(beadTypes) == 0 {
-		beadTypes = defaultBeadTypes
-	}
+	beadTypes := getDivaBeadTypes(s.server.divaRepo)
 
 	lang := getLangStrings(s.server)
 	bf := byteframe.NewByteFrame()
@@ -173,21 +184,63 @@ func handleMsgMhfGetKijuInfo(s *Session, p mhfpacket.MHFPacket) {
 
 func handleMsgMhfSetKiju(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfSetKiju)
-	beadIndex := int(pkt.Unk1)
-	expiry := TimeAdjusted().Add(24 * time.Hour)
-	if err := s.server.divaRepo.AssignBead(s.charID, beadIndex, expiry); err != nil {
+	colorID := int(pkt.Unk1)
+	beadTypes := getDivaBeadTypes(s.server.divaRepo)
+	if colorID < 1 || colorID > len(beadTypes) {
+		s.logger.Warn("Rejected invalid Diva bead selection",
+			zap.Uint32("charID", s.charID),
+			zap.Int("colorID", colorID),
+			zap.Int("slotCount", len(beadTypes)))
+		doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00})
+		return
+	}
+	expiry := nextDivaSelectionExpiry(TimeAdjusted())
+	if err := s.server.divaRepo.AssignBead(s.charID, colorID, expiry); err != nil {
 		s.logger.Warn("Failed to assign bead",
 			zap.Uint32("charID", s.charID),
-			zap.Int("beadIndex", beadIndex),
+			zap.Int("colorID", colorID),
 			zap.Error(err))
 	} else {
-		s.currentBeadIndex = beadIndex
+		s.currentBeadIndex = colorID
+		s.logger.Info("Saved Diva bead selection",
+			zap.Uint32("charID", s.charID),
+			zap.Int("colorID", colorID))
 	}
 	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00})
 }
 
+// nextDivaSelectionExpiry aligns prayer-bead selection with the same JST noon
+// boundary used by Diva daily results instead of using a rolling 24 hours.
+func nextDivaSelectionExpiry(now time.Time) time.Time {
+	y, m, d := now.Date()
+	noon := time.Date(y, m, d, 12, 0, 0, 0, now.Location())
+	if !now.Before(noon) {
+		noon = noon.Add(24 * time.Hour)
+	}
+	return noon
+}
+
 func handleMsgMhfAddUdPoint(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfAddUdPoint)
+	// Prayer-bead selection persists across the JST-noon tally boundary. Reload
+	// a missing session value before submission so reconnects cannot record only
+	// the event total while silently omitting the daily bead row.
+	if s.currentBeadIndex < 0 {
+		restoreDivaBeadSelection(s)
+	}
+	s.logger.Info("Received Diva point submission",
+		zap.Uint32("charID", s.charID),
+		zap.Uint32("questPoints", pkt.QuestPoints),
+		zap.Uint32("bonusPoints", pkt.BonusPoints),
+		zap.Uint32("ackHandle", pkt.AckHandle),
+		zap.Int("activeColorID", s.currentBeadIndex))
+	if s.hasLastDivaPointAck && s.lastDivaPointAck == pkt.AckHandle {
+		s.logger.Info("Ignored duplicate Diva point submission",
+			zap.Uint32("charID", s.charID),
+			zap.Uint32("ackHandle", pkt.AckHandle))
+		doAckBufSucceed(s, pkt.AckHandle, []byte{0x00})
+		return
+	}
 
 	// Find the current diva event to associate points with.
 	eventID := uint32(0)
@@ -199,64 +252,119 @@ func handleMsgMhfAddUdPoint(s *Session, p mhfpacket.MHFPacket) {
 	}
 
 	if eventID != 0 && s.charID != 0 && (pkt.QuestPoints > 0 || pkt.BonusPoints > 0) {
-		if err := s.server.divaRepo.AddPoints(s.charID, eventID, pkt.QuestPoints, pkt.BonusPoints); err != nil {
+		if err := s.server.divaRepo.AddPointSubmission(s.charID, eventID, pkt.QuestPoints, pkt.BonusPoints, s.currentBeadIndex); err != nil {
 			s.logger.Warn("Failed to add diva points",
 				zap.Uint32("charID", s.charID),
 				zap.Uint32("questPoints", pkt.QuestPoints),
 				zap.Uint32("bonusPoints", pkt.BonusPoints),
 				zap.Error(err))
+		} else {
+			s.lastDivaPointAck = pkt.AckHandle
+			s.hasLastDivaPointAck = true
+			s.logger.Info("Saved Diva point submission",
+				zap.Uint32("charID", s.charID),
+				zap.Uint32("eventID", eventID),
+				zap.Uint32("questPoints", pkt.QuestPoints),
+				zap.Uint32("bonusPoints", pkt.BonusPoints))
 		}
-		if s.currentBeadIndex >= 0 {
-			total := int(pkt.QuestPoints) + int(pkt.BonusPoints)
-			if total > 0 {
-				if err := s.server.divaRepo.AddBeadPoints(s.charID, s.currentBeadIndex, total); err != nil {
-					s.logger.Warn("Failed to add bead points",
-						zap.Uint32("charID", s.charID),
-						zap.Int("beadIndex", s.currentBeadIndex),
-						zap.Error(err))
-				}
-			}
-		}
+	} else {
+		s.logger.Warn("Ignored Diva point submission",
+			zap.Uint32("charID", s.charID),
+			zap.Uint32("eventID", eventID),
+			zap.Uint32("questPoints", pkt.QuestPoints),
+			zap.Uint32("bonusPoints", pkt.BonusPoints))
 	}
 
-	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
+	doAckBufSucceed(s, pkt.AckHandle, []byte{0x00})
 }
 
 func handleMsgMhfGetUdMyPoint(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdMyPoint)
 
-	// RE confirms: no count prefix. Client hardcodes exactly 8 loop iterations.
+	// RE confirms: u8 error/status followed by exactly 8 entries; no count prefix.
 	// Per-entry stride is 18 bytes:
-	//   +0x00 u8  bead_index
-	//   +0x01 u32 points
-	//   +0x05 u32 points_dupe  (same value as points)
-	//   +0x09 u8  unk1         (half-period: 0=first 12h, 1=second 12h)
-	//   +0x0A u32 unk2
-	//   +0x0E u32 unk3
-	// Total: 8 × 18 = 144 bytes.
-	beadPoints, err := s.server.divaRepo.GetCharacterBeadPoints(s.charID)
+	//   +0x00 u8  bead A index
+	//   +0x01 u32 bead A quest points
+	//   +0x05 u32 bead A bonus points
+	//   +0x09 u8  bead B index
+	//   +0x0A u32 bead B quest points
+	//   +0x0E u32 bead B bonus points
+	// Total: 1 + 8 × 18 = 145 bytes.
+	eventID := uint32(0)
+	events, err := s.server.divaRepo.GetEvents()
+	if err == nil && len(events) > 0 {
+		eventID = events[len(events)-1].ID
+	}
+	var entries []DivaBeadPointEntry
+	if eventID != 0 {
+		entries, err = s.server.divaRepo.GetCharacterBeadPointEntries(s.charID, eventID)
+	}
 	if err != nil {
-		s.logger.Warn("Failed to get bead points", zap.Uint32("charID", s.charID), zap.Error(err))
-		beadPoints = map[int]int{}
+		s.logger.Warn("Failed to get Diva character point history", zap.Uint32("charID", s.charID), zap.Uint32("eventID", eventID), zap.Error(err))
+		entries = nil
 	}
-	activeBead := uint8(0)
-	if s.currentBeadIndex >= 0 {
-		activeBead = uint8(s.currentBeadIndex)
-	}
-	pts := uint32(0)
-	if s.currentBeadIndex >= 0 {
-		if p, ok := beadPoints[s.currentBeadIndex]; ok {
-			pts = uint32(p)
+	// Refresh the persisted selection. A bead remains selected across noon; its
+	// expiry is the change-lock boundary rather than selection invalidation.
+	restoreDivaBeadSelection(s)
+
+	type pointPair struct{ quest, bonus uint64 }
+	daily := make([]map[int]pointPair, 8)
+	if len(events) > 0 {
+		eventStart := time.Unix(int64(events[len(events)-1].StartTime), 0)
+		for _, entry := range entries {
+			for day := 0; day < len(daily); day++ {
+				start, end := divaTallyWindow(eventStart, day)
+				if !entry.Timestamp.Before(start) && entry.Timestamp.Before(end) {
+					if daily[day] == nil {
+						daily[day] = make(map[int]pointPair)
+					}
+					p := daily[day][entry.BeadIndex]
+					p.quest += uint64(entry.QuestPoints)
+					p.bonus += uint64(entry.BonusPoints)
+					daily[day][entry.BeadIndex] = p
+					break
+				}
+			}
+		}
+		// A newly selected bead must remain visible after reconnect even before
+		// the player earns the first points of that day.
+		if s.currentBeadIndex >= 0 {
+			now := TimeAdjusted()
+			for day := 0; day < len(daily); day++ {
+				start, end := divaTallyWindow(eventStart, day)
+				if !now.Before(start) && now.Before(end) {
+					if daily[day] == nil {
+						daily[day] = make(map[int]pointPair)
+					}
+					if _, exists := daily[day][s.currentBeadIndex]; !exists {
+						daily[day][s.currentBeadIndex] = pointPair{}
+					}
+					break
+				}
+			}
 		}
 	}
 	bf := byteframe.NewByteFrame()
-	for i := 0; i < 8; i++ {
-		bf.WriteUint8(activeBead)
-		bf.WriteUint32(pts)
-		bf.WriteUint32(pts)         // points_dupe
-		bf.WriteUint8(uint8(i % 2)) // unk1: 0=first half, 1=second half
-		bf.WriteUint32(0)           // unk2
-		bf.WriteUint32(0)           // unk3
+	bf.WriteUint8(0) // error/status: success
+	for day := 0; day < 8; day++ {
+		beads := make([]int, 0, len(daily[day]))
+		for bead := range daily[day] {
+			beads = append(beads, bead)
+		}
+		sort.Ints(beads)
+		for slot := 0; slot < 2; slot++ {
+			if slot < len(beads) {
+				bead := beads[slot]
+				points := daily[day][bead]
+				bf.WriteUint8(uint8(bead))
+				bf.WriteUint32(uint32(points.quest))
+				bf.WriteUint32(uint32(points.bonus))
+			} else {
+				bf.WriteUint8(0)
+				bf.WriteUint32(0)
+				bf.WriteUint32(0)
+			}
+		}
 	}
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
@@ -272,7 +380,12 @@ var udMilestones = []uint64{
 func handleMsgMhfGetUdTotalPointInfo(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdTotalPointInfo)
 
-	total, err := s.server.divaRepo.GetTotalBeadPoints()
+	eventID := uint32(0)
+	events, eventErr := s.server.divaRepo.GetEvents()
+	if eventErr == nil && len(events) > 0 {
+		eventID = events[len(events)-1].ID
+	}
+	total, err := s.server.divaRepo.GetTotalBeadPoints(eventID)
 	if err != nil {
 		s.logger.Warn("Failed to get total bead points", zap.Error(err))
 	}
@@ -302,9 +415,25 @@ func handleMsgMhfGetUdSelectedColorInfo(s *Session, p mhfpacket.MHFPacket) {
 	// RE confirms: exactly 9 bytes = u8 error + u8[8] winning colors.
 	bf := byteframe.NewByteFrame()
 	bf.WriteUint8(0) // error = success
+	var eventStart time.Time
+	var eventID uint32
+	events, err := s.server.divaRepo.GetEvents()
+	if err != nil {
+		s.logger.Error("Failed to query Diva event for selected colors", zap.Error(err))
+	} else if len(events) > 0 {
+		currentEvent := events[len(events)-1]
+		eventID = currentEvent.ID
+		eventStart = time.Unix(int64(currentEvent.StartTime), 0)
+	}
 	for day := 0; day < 8; day++ {
-		topBead, err := s.server.divaRepo.GetTopBeadPerDay(day)
+		topBead := 0
+		if !eventStart.IsZero() {
+			topBead, err = s.server.divaRepo.GetTopBeadPerDay(eventID, eventStart, day)
+		}
 		if err != nil {
+			s.logger.Warn("Failed to get Diva winning color",
+				zap.Int("day", day),
+				zap.Error(err))
 			topBead = 0
 		}
 		bf.WriteUint8(uint8(topBead))
@@ -447,39 +576,349 @@ func handleMsgMhfGetUdMonsterPoint(s *Session, p mhfpacket.MHFPacket) {
 func handleMsgMhfGetUdDailyPresentList(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdDailyPresentList)
 	// DailyPresentList: u16 count + count × 15-byte entries.
-	// Entry: u8 rank_type, u16 rank_from, u16 rank_to, u8 item_type,
-	//        u16 _pad0(skip), u16 item_id, u16 _pad1(skip), u16 quantity, u8 unk.
-	// Padding at +6 and +10 is NOT read by the client.
+	// Entry: u8 item_type, u16 item_id, u16 quantity, u8 condition_type,
+	//        u32 condition_from, u32 condition_to, u8 participation_day.
+	// Condition type 1 selects the GR page/range branch. The final byte is a
+	// one-based grouping/display key for participation days 1..7.
 	bf := byteframe.NewByteFrame()
-	bf.WriteUint16(0) // count = 0 (no entries configured)
+	bf.WriteUint16(7)
+	for day := uint16(1); day <= 7; day++ {
+		bf.WriteUint8(divaRewardItemType)
+		bf.WriteUint16(divaRewardItemID)
+		bf.WriteUint16(divaRewardQuantity)
+		bf.WriteUint8(1)  // GR condition
+		bf.WriteUint32(1) // GR1
+		bf.WriteUint32(999)
+		bf.WriteUint8(uint8(day))
+	}
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 func handleMsgMhfGetUdNormaPresentList(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdNormaPresentList)
 	// NormaPresentList: u16 count + count × 19-byte entries.
-	// Same layout as DailyPresent (+0x00..+0x0D), plus:
+	// Same item/condition layout as DailyPresent (+0x00..+0x0D), plus:
 	//   +0x0E u32 points_required (norma threshold)
 	//   +0x12 u8  bead_type (BeadType that unlocks this tier)
-	// Padding at +6 and +10 NOT read.
 	bf := byteframe.NewByteFrame()
-	bf.WriteUint16(0) // count = 0 (no entries configured)
+	bf.WriteUint16(1)
+	bf.WriteUint8(divaRewardItemType)
+	bf.WriteUint16(divaRewardItemID)
+	bf.WriteUint16(divaRewardQuantity)
+	bf.WriteUint8(1) // GR condition
+	bf.WriteUint32(1)
+	bf.WriteUint32(999) // GR1 and above (retail maximum GR is 999)
+	bf.WriteUint32(1)   // any positive personal contribution
+	bf.WriteUint8(0)    // any prayer bead
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+}
+
+const (
+	// Client item acquisition dispatches ordinary inventory items only for
+	// type 7. Type 0 is displayable but deliberately performs no grant.
+	divaRewardItemType = uint8(7)
+	divaRewardItemID   = uint16(12306)
+	divaRewardQuantity = uint16(99)
+	divaRewardMaxBatch = 33
+)
+
+type divaGrantedReward struct {
+	rewardID uint32
+	itemType uint8
+	itemID   uint16
+	quantity uint16
+}
+
+func divaRewardKeys(s *Session, event DivaEvent, rewardType uint8) ([]string, error) {
+	switch rewardType {
+	case 0: // daily participation, one claim for every contributed prayer day
+		days, err := s.server.divaRepo.GetParticipationDays(
+			s.charID, event.ID, time.Unix(int64(event.StartTime), 0))
+		if err != nil {
+			return nil, err
+		}
+		keys := make([]string, 0, len(days))
+		for _, day := range days {
+			keys = append(keys, fmt.Sprintf("day:%d", day+1))
+		}
+		return keys, nil
+	case 1, 4: // normal-Diva personal milestone/GCP
+		quest, bonus, err := s.server.divaRepo.GetPoints(s.charID, event.ID)
+		if err != nil || quest+bonus <= 0 {
+			return nil, err
+		}
+		return []string{"participation"}, nil
+	case 6: // interception personal achievement
+		points, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID)
+		if err != nil {
+			return nil, err
+		}
+		for _, value := range points {
+			if value > 0 {
+				return []string{"interception-personal"}, nil
+			}
+		}
+		return nil, nil
+	case 2: // personal ranking
+		rankings, err := s.server.divaRepo.GetPersonalRankings(event.ID)
+		if err != nil {
+			return nil, err
+		}
+		rank, _ := findDivaRanking(rankings, s.charID)
+		if rank == 0 {
+			return nil, nil
+		}
+		return []string{"ranking"}, nil
+	case 3: // normal-Diva guild ranking
+		guildID, err := s.server.divaRepo.GetCharacterGuildID(s.charID)
+		if err != nil || guildID == 0 {
+			return nil, err
+		}
+		rankings, err := s.server.divaRepo.GetGuildRankings(event.ID)
+		if err != nil {
+			return nil, err
+		}
+		rank, _ := findDivaRanking(rankings, guildID)
+		if rank == 0 {
+			return nil, nil
+		}
+		return []string{"guild"}, nil
+	case 7: // interception guild achievement
+		guildID, err := s.server.divaRepo.GetCharacterGuildID(s.charID)
+		if err != nil || guildID == 0 {
+			return nil, err
+		}
+		rankings, err := s.server.divaRepo.GetInterceptionGuildRankings()
+		if err != nil {
+			return nil, err
+		}
+		rank, _ := findDivaRanking(rankings, guildID)
+		if rank == 0 {
+			return nil, nil
+		}
+		return []string{"interception-guild"}, nil
+	case 5: // interception treasure/achievement
+		points, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID)
+		if err != nil {
+			return nil, err
+		}
+		for _, value := range points {
+			if value > 0 {
+				return []string{"interception"}, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func handleMsgMhfAcquireUdItem(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfAcquireUdItem)
-	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
+	// Client response decoder expects a buffered payload:
+	//   u8 status, u8 result_count, result_count * 9-byte entries.
+	// Each result is u32 reward_id, u8 item_type, u16 item_id, u16 quantity.
+	// Returning a simple ACK makes the client treat unrelated ACK bytes as the
+	// result array and can terminate the client while claiming a daily reward.
+	granted := make([]divaGrantedReward, 0, len(pkt.ItemIDs))
+	events, err := s.server.divaRepo.GetEvents()
+	if err == nil && len(events) > 0 && pkt.RewardType <= 7 {
+		event := events[len(events)-1]
+		keys, keyErr := divaRewardKeys(s, event, pkt.RewardType)
+		if keyErr != nil {
+			s.logger.Error("Failed to resolve Diva reward eligibility", zap.Error(keyErr))
+		} else {
+			requestCount := len(pkt.ItemIDs)
+			claimAll := pkt.Unk0 != 0
+			if claimAll {
+				requestCount = int(pkt.ItemIDCount)
+				if requestCount == 0 || requestCount > len(keys) {
+					requestCount = len(keys)
+				}
+			}
+			if requestCount > divaRewardMaxBatch {
+				requestCount = divaRewardMaxBatch
+			}
+			for i := 0; i < requestCount; i++ {
+				if !claimAll && pkt.ItemIDs[i] != uint32(divaRewardItemID) {
+					continue
+				}
+				for _, key := range keys {
+					claimed, claimErr := s.server.divaRepo.TryClaimReward(
+						event.ID, s.charID, pkt.RewardType, key,
+						uint32(divaRewardItemID), uint32(divaRewardQuantity))
+					if claimErr != nil {
+						s.logger.Error("Failed to reserve Diva reward", zap.Error(claimErr))
+						break
+					}
+					if !claimed {
+						continue
+					}
+					if markErr := s.server.divaRepo.MarkRewardDelivered(event.ID, s.charID, pkt.RewardType, key); markErr != nil {
+						_ = s.server.divaRepo.ReleaseRewardClaim(event.ID, s.charID, pkt.RewardType, key)
+						s.logger.Error("Failed to mark Diva reward delivered", zap.Error(markErr))
+						break
+					}
+					granted = append(granted, divaGrantedReward{
+						rewardID: uint32(divaRewardItemID), itemType: divaRewardItemType,
+						itemID:   divaRewardItemID,
+						quantity: divaRewardQuantity,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	bf := byteframe.NewByteFrame()
+	bf.WriteUint8(0)
+	bf.WriteUint8(uint8(len(granted)))
+	for _, reward := range granted {
+		bf.WriteUint32(reward.rewardID)
+		bf.WriteUint8(reward.itemType)
+		bf.WriteUint16(reward.itemID)
+		bf.WriteUint16(reward.quantity)
+	}
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+}
+
+const divaRankingLimit = 100
+
+func divaRankingScore(score int64) uint32 {
+	if score <= 0 {
+		return 0
+	}
+	if score > int64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(score)
+}
+
+func getCurrentDivaEventID(s *Session) (uint32, error) {
+	events, err := s.server.divaRepo.GetEvents()
+	if err != nil || len(events) == 0 {
+		return 0, err
+	}
+	return events[len(events)-1].ID, nil
+}
+
+// writeDivaPersonalRankings writes the client's fixed 100-entry shape:
+// u16 rank, char[25] name, u32 score.
+func writeDivaPersonalRankings(bf *byteframe.ByteFrame, rankings []DivaRankingEntry) {
+	for i := 0; i < divaRankingLimit; i++ {
+		if i < len(rankings) {
+			bf.WriteUint16(uint16(i + 1))
+			bf.WriteBytes(stringsupport.PaddedString(rankings[i].Name, 25, true))
+			bf.WriteUint32(divaRankingScore(rankings[i].Score))
+			continue
+		}
+		bf.WriteBytes(make([]byte, 31))
+	}
+}
+
+// writeDivaGuildRankings writes u16 rank, char[25] name, four guild-emblem
+// uint32 fields, and u32 score. Emblem data is not stored by the Diva service,
+// so those cosmetic fields remain zero without affecting rank/name/score.
+func writeDivaGuildRankings(bf *byteframe.ByteFrame, rankings []DivaRankingEntry) {
+	for i := 0; i < divaRankingLimit; i++ {
+		if i < len(rankings) {
+			bf.WriteUint16(uint16(i + 1))
+			bf.WriteBytes(stringsupport.PaddedString(rankings[i].Name, 25, true))
+			bf.WriteBytes(make([]byte, 16))
+			bf.WriteUint32(divaRankingScore(rankings[i].Score))
+			continue
+		}
+		bf.WriteBytes(make([]byte, 47))
+	}
+}
+
+func findDivaRanking(rankings []DivaRankingEntry, id uint32) (uint32, uint32) {
+	for i, entry := range rankings {
+		if entry.ID == id {
+			return uint32(i + 1), divaRankingScore(entry.Score)
+		}
+	}
+	return 0, 0
 }
 
 func handleMsgMhfGetUdRanking(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdRanking)
-	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
+	bf := byteframe.NewByteFrame()
+	eventID, err := getCurrentDivaEventID(s)
+	if err != nil || eventID == 0 {
+		if err != nil {
+			s.logger.Error("Failed to resolve Diva event for ranking", zap.Error(err))
+		}
+		if pkt.Unk0&1 == 0 {
+			writeDivaPersonalRankings(bf, nil)
+		} else {
+			writeDivaGuildRankings(bf, nil)
+		}
+		doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+		return
+	}
+
+	if pkt.Unk0&1 == 0 {
+		rankings, rankingErr := s.server.divaRepo.GetPersonalRankings(eventID)
+		if rankingErr != nil {
+			s.logger.Error("Failed to query Diva personal ranking", zap.Error(rankingErr))
+			rankings = nil
+		}
+		writeDivaPersonalRankings(bf, rankings)
+	} else {
+		rankings, rankingErr := s.server.divaRepo.GetGuildRankings(eventID)
+		if rankingErr != nil {
+			s.logger.Error("Failed to query Diva guild ranking", zap.Error(rankingErr))
+			rankings = nil
+		}
+		writeDivaGuildRankings(bf, rankings)
+	}
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 func handleMsgMhfGetUdMyRanking(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdMyRanking)
-	// Temporary canned response
-	data, _ := hex.DecodeString("00000515000005150000CEB4000003CE000003CE0000CEB44D49444E494748542D414E47454C0000000000000000000000")
-	doAckBufSucceed(s, pkt.AckHandle, data)
+	bf := byteframe.NewByteFrame()
+	eventID, err := getCurrentDivaEventID(s)
+	if err != nil || eventID == 0 {
+		bf.WriteBytes(make([]byte, 49))
+		doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+		return
+	}
+
+	personal, personalErr := s.server.divaRepo.GetPersonalRankings(eventID)
+	guilds, guildErr := s.server.divaRepo.GetGuildRankings(eventID)
+	guildID, membershipErr := s.server.divaRepo.GetCharacterGuildID(s.charID)
+	if personalErr != nil || guildErr != nil || membershipErr != nil {
+		fields := make([]zap.Field, 0, 3)
+		if personalErr != nil {
+			fields = append(fields, zap.NamedError("personal", personalErr))
+		}
+		if guildErr != nil {
+			fields = append(fields, zap.NamedError("guild", guildErr))
+		}
+		if membershipErr != nil {
+			fields = append(fields, zap.NamedError("membership", membershipErr))
+		}
+		s.logger.Error("Failed to query Diva current ranking", fields...)
+		bf.WriteBytes(make([]byte, 49))
+		doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+		return
+	}
+
+	personalRank, personalScore := findDivaRanking(personal, s.charID)
+	guildRank, guildScore := findDivaRanking(guilds, guildID)
+	// The client decodes current/previous/score for personal and guild, followed
+	// by the 25-byte guild name. Until ranking snapshots exist, previous equals
+	// current, which avoids fabricating a movement indicator.
+	bf.WriteUint32(personalRank)
+	bf.WriteUint32(personalRank)
+	bf.WriteUint32(personalScore)
+	bf.WriteUint32(guildRank)
+	bf.WriteUint32(guildRank)
+	bf.WriteUint32(guildScore)
+	guildName := ""
+	if guildRank > 0 {
+		guildName = guilds[guildRank-1].Name
+	}
+	bf.WriteBytes(stringsupport.PaddedString(guildName, 25, true))
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }

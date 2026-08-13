@@ -17,10 +17,18 @@ func handleMsgMhfGetAdditionalBeatReward(s *Session, p mhfpacket.MHFPacket) {
 func handleMsgMhfGetUdRankingRewardList(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdRankingRewardList)
 	// RankingRewardList: u16 count + count × 14-byte entries.
-	// Entry: u8 rank_type, u16 rank_from, u16 rank_to, u8 item_type,
-	//        u32 item_id, u32 quantity. No padding gaps.
+	// Entry: u8 item_type, u16 item_id, u16 quantity, u8 rank_type,
+	//        u32 rank_from, u32 rank_to. No padding gaps.
 	bf := byteframe.NewByteFrame()
-	bf.WriteUint16(0) // count = 0 (no entries configured)
+	bf.WriteUint16(2)
+	for rankType := uint8(0); rankType <= 1; rankType++ {
+		bf.WriteUint8(divaRewardItemType)
+		bf.WriteUint16(divaRewardItemID)
+		bf.WriteUint16(divaRewardQuantity)
+		bf.WriteUint8(rankType) // 0 personal, 1 guild
+		bf.WriteUint32(1)
+		bf.WriteUint32(100)
+	}
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
