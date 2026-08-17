@@ -24,7 +24,7 @@ type MsgMhfAcquireUdItem struct {
 	// guild achievement = 7
 	RewardType  uint8
 	ItemIDCount uint8
-	Unk3        []byte
+	ItemIDs     []uint32
 }
 
 // Opcode returns the ID associated with this packet type.
@@ -38,8 +38,13 @@ func (m *MsgMhfAcquireUdItem) Parse(bf *byteframe.ByteFrame, ctx *clientctx.Clie
 	m.Unk0 = bf.ReadUint8()
 	m.RewardType = bf.ReadUint8()
 	m.ItemIDCount = bf.ReadUint8()
-	for i := uint8(0); i < m.ItemIDCount; i++ {
-		bf.ReadUint32()
+	m.ItemIDs = make([]uint32, 0, m.ItemIDCount)
+	// Unk0 == 0 is selective claim and carries an explicit ID array. The
+	// client's "claim all" form (Unk0 != 0) carries only the count.
+	if m.Unk0 == 0 {
+		for i := uint8(0); i < m.ItemIDCount; i++ {
+			m.ItemIDs = append(m.ItemIDs, bf.ReadUint32())
+		}
 	}
 	return nil
 }

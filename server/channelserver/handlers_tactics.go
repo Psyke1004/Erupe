@@ -3,9 +3,9 @@ package channelserver
 import (
 	"encoding/hex"
 	"fmt"
-	"strconv"
 
 	"erupe-ce/common/byteframe"
+	"erupe-ce/common/stringsupport"
 	"erupe-ce/network/mhfpacket"
 	"go.uber.org/zap"
 )
@@ -20,33 +20,28 @@ func handleMsgMhfGetUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 		pointsMap = map[string]int{}
 	}
 
-	// Build per-quest list and compute total.
-	type questEntry struct {
-		questFileID uint32
-		points      int
-	}
-	var entries []questEntry
+	// The ZZ client decoder for MSG_MHF_GET_UD_TACTICS_POINT expects:
+	//   status:u8, total:u32, entry_count:u8, entries:entry_count*u16
+	// The entries are optional map-detail values, not quest ID/point pairs.
+	// Returning the old u32 count followed by u32 pairs shifted the decoder and
+	// made a persisted total disappear (or display arbitrary values) after the
+	// result screen's locally calculated total was gone.
 	var total int
-	for k, pts := range pointsMap {
-		// ParseUint with bitSize 32 rejects keys that don't fit in a
-		// uint32 instead of silently truncating them (unlike Atoi followed
-		// by a uint32 conversion), since these are written to the wire as
-		// uint32 below.
-		qid, err := strconv.ParseUint(k, 10, 32)
-		if err != nil {
+	for _, pts := range pointsMap {
+		if pts <= 0 {
 			continue
 		}
-		entries = append(entries, questEntry{uint32(qid), pts})
 		total += pts
 	}
+	s.logger.Debug("Retrieved Diva tactics points",
+		zap.Uint32("charID", s.charID),
+		zap.Int("total", total),
+		zap.Int("storedQuestEntries", len(pointsMap)))
 
 	bf := byteframe.NewByteFrame()
+	bf.WriteUint8(0) // status: success
 	bf.WriteUint32(uint32(total))
-	bf.WriteUint32(uint32(len(entries)))
-	for _, e := range entries {
-		bf.WriteUint32(e.questFileID)
-		bf.WriteUint32(uint32(e.points))
-	}
+	bf.WriteUint8(0) // no optional map-detail values
 
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
@@ -66,12 +61,18 @@ func handleMsgMhfAddUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfAddUdTacticsPoint)
 	questFileID := int(pkt.QuestID)
 	points := int(pkt.TacticsPoints)
+	s.logger.Info("Received Diva tactics point submission",
+		zap.Uint32("charID", s.charID),
+		zap.Int("questFileID", questFileID),
+		zap.Int("points", points))
 
 	if questFileID < udTacticsQuestMin || questFileID > udTacticsQuestMax {
 		s.logger.Warn("AddUdTacticsPoint: quest file ID out of range",
 			zap.Int("questFileID", questFileID),
 			zap.String("range", fmt.Sprintf("%d-%d", udTacticsQuestMin, udTacticsQuestMax)))
-		doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
+		// The client registered MSG_MHF_ADD_UD_TACTICS_POINT as a buffered
+		// response and decodes status:u8, detail_count:u8, then u16 details.
+		doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00})
 		return
 	}
 
@@ -82,30 +83,61 @@ func handleMsgMhfAddUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 				zap.Int("questFileID", questFileID),
 				zap.Int("points", points),
 				zap.Error(err))
+		} else {
+			s.logger.Info("Saved Diva tactics point submission",
+				zap.Uint32("charID", s.charID),
+				zap.Int("questFileID", questFileID),
+				zap.Int("points", points))
 		}
 	}
 
-	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00})
+	// An empty successful detail list. A simple ACK here leaves the client's
+	// interception submission state unresolved even though the DB update ran.
+	doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00})
 }
 
+const divaTacticsPrizeLimit = 512
+
 func writeDivaPrizeList(bf *byteframe.ByteFrame, prizes []DivaPrize) {
-	bf.WriteUint32(uint32(len(prizes)))
+	if len(prizes) == 0 {
+		prizes = []DivaPrize{{PointsReq: 1}}
+	}
+	// The client stores each list in a fixed 512-entry array. Its decoder reads
+	// a u16 count followed by 11-byte records; widening either the count or the
+	// one-byte item type shifts every subsequent field and can overrun that
+	// array while opening the Inspector reward screen.
+	if len(prizes) > divaTacticsPrizeLimit {
+		prizes = prizes[:divaTacticsPrizeLimit]
+	}
+	bf.WriteUint16(uint16(len(prizes)))
 	for _, p := range prizes {
 		bf.WriteUint32(uint32(p.PointsReq))
-		bf.WriteUint16(uint16(p.ItemType))
-		bf.WriteUint16(uint16(p.ItemID))
-		bf.WriteUint16(uint16(p.Quantity))
-		if p.GR {
-			bf.WriteUint8(1)
-		} else {
-			bf.WriteUint8(0)
-		}
+		bf.WriteUint8(divaRewardItemType)
+		bf.WriteUint16(divaRewardItemID)
+		bf.WriteUint16(divaRewardQuantity)
+		// The Inspector uses this byte to select its HR/GR reward page. All
+		// Diva Defense live-test rewards are GR rewards regardless of stale DB
+		// prize rows created with gr=false by older migrations.
+		bf.WriteUint8(1)
 		if p.Repeatable {
 			bf.WriteUint8(1)
 		} else {
 			bf.WriteUint8(0)
 		}
 	}
+}
+
+func writeDivaInterceptionAreaPrizeList(bf *byteframe.ByteFrame) {
+	// The third Inspector list is the "Reclaimed Areas & Point" track. Its
+	// client record is 13 bytes: item type/id/quantity followed by the reclaimed
+	// area and interception-point requirements. Keep the live-test reward and
+	// its maximum stack identical to the other Diva Defense tracks.
+	bf.WriteUint16(1)
+	bf.WriteUint8(divaRewardItemType)
+	bf.WriteUint16(divaRewardItemID)
+	bf.WriteUint16(divaRewardQuantity)
+	bf.WriteUint32(1) // at least one reclaimed-area/progression unit
+	bf.WriteUint32(1) // at least one interception point
 }
 
 func handleMsgMhfGetUdTacticsRewardList(s *Session, p mhfpacket.MHFPacket) {
@@ -122,8 +154,10 @@ func handleMsgMhfGetUdTacticsRewardList(s *Session, p mhfpacket.MHFPacket) {
 	}
 
 	bf := byteframe.NewByteFrame()
+	bf.WriteUint8(0) // status: success
 	writeDivaPrizeList(bf, personal)
 	writeDivaPrizeList(bf, guild)
+	writeDivaInterceptionAreaPrizeList(bf)
 
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
@@ -156,16 +190,74 @@ func handleMsgMhfGetUdTacticsFirstQuestBonus(s *Session, p mhfpacket.MHFPacket) 
 
 func handleMsgMhfGetUdTacticsRemainingPoint(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdTacticsRemainingPoint)
+	guildID := pkt.Unk0
+	if guildID == 0 {
+		guildID, _ = s.server.divaRepo.GetCharacterGuildID(s.charID)
+	}
+	var guildScore uint32
+	if guildID != 0 {
+		if rankings, err := s.server.divaRepo.GetInterceptionGuildRankings(); err == nil {
+			_, guildScore = findDivaRanking(rankings, guildID)
+		}
+	}
+	remaining := uint32(0)
+	if guildScore < divaInterceptionAreaPointRequirement*divaInterceptionAreaCount {
+		remaining = divaInterceptionAreaPointRequirement - guildScore%divaInterceptionAreaPointRequirement
+	}
 	bf := byteframe.NewByteFrame()
-	bf.WriteUint32(0) // Points until Special Guild Hall earned
+	bf.WriteUint32(remaining)
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 func handleMsgMhfGetUdTacticsRanking(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdTacticsRanking)
-	// Temporary canned response
-	data, _ := hex.DecodeString("00000515000005150000CEB4000003CE000003CE0000CEB44D49444E494748542D414E47454C0000000000000000000000")
-	doAckBufSucceed(s, pkt.AckHandle, data)
+	rankings, err := s.server.divaRepo.GetInterceptionGuildRankings()
+	if err != nil {
+		s.logger.Error("Failed to query Diva interception guild ranking", zap.Error(err))
+		rankings = nil
+	}
+
+	// The client may send zero while asking for its own guild. Resolve it here
+	// instead of ever placing the numeric guild ID in a display-name field.
+	guildID := pkt.GuildID
+	if guildID == 0 {
+		guildID, err = s.server.divaRepo.GetCharacterGuildID(s.charID)
+		if err != nil {
+			s.logger.Error("Failed to resolve Diva interception guild", zap.Error(err))
+			guildID = 0
+		}
+	}
+
+	myRank, myScore := findDivaRanking(rankings, guildID)
+	myGuildName := ""
+	if myRank > 0 {
+		myGuildName = rankings[myRank-1].Name
+	}
+
+	// mhfo.dll 0x11510490 decodes exactly:
+	//   u32 own_rank, u32 own_score, char own_guild_name[32], u8 count
+	//   count * (u32 rank, u32 score, char guild_name[32])
+	// The registered 4041-byte result buffer therefore holds at most 100 rows.
+	if len(rankings) > divaRankingLimit {
+		rankings = rankings[:divaRankingLimit]
+	}
+	bf := byteframe.NewByteFrame()
+	bf.WriteUint32(myRank)
+	bf.WriteUint32(myScore)
+	bf.WriteBytes(stringsupport.PaddedString(myGuildName, 32, true))
+	bf.WriteUint8(uint8(len(rankings)))
+	for i, ranking := range rankings {
+		bf.WriteUint32(uint32(i + 1))
+		bf.WriteUint32(divaRankingScore(ranking.Score))
+		bf.WriteBytes(stringsupport.PaddedString(ranking.Name, 32, true))
+	}
+	s.logger.Debug("Retrieved Diva interception guild ranking",
+		zap.Uint32("charID", s.charID),
+		zap.Uint32("guildID", guildID),
+		zap.Uint32("rank", myRank),
+		zap.Uint32("score", myScore),
+		zap.Int("entries", len(rankings)))
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 func handleMsgMhfSetUdTacticsFollower(s *Session, p mhfpacket.MHFPacket) {} // stub: unimplemented

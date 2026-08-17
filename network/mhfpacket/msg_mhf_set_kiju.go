@@ -22,7 +22,11 @@ func (m *MsgMhfSetKiju) Opcode() network.PacketID {
 // Parse parses the packet from binary
 func (m *MsgMhfSetKiju) Parse(bf *byteframe.ByteFrame, ctx *clientctx.ClientContext) error {
 	m.AckHandle = bf.ReadUint32()
-	m.Unk1 = bf.ReadUint16()
+	// The client sends a one-byte zero-based UI slot followed by one byte of
+	// padding. Reading both bytes as a big-endian uint16 turns slot 2 (02 00)
+	// into 512 and causes the server to reject a valid selection.
+	m.Unk1 = uint16(bf.ReadUint8())
+	bf.ReadUint8() // padding
 	return nil
 }
 

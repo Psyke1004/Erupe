@@ -1,6 +1,7 @@
 package channelserver
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"testing"
 	"time"
@@ -828,6 +829,10 @@ func TestGuildAllianceRelationship(t *testing.T) {
 
 func TestHandleMsgMhfGetUdGuildMapInfo(t *testing.T) {
 	server := createMockServer()
+	server.guildRepo = &mockGuildRepo{guild: &Guild{ID: 10, Name: "TestGuild"}}
+	server.divaRepo = &mockDivaRepo{interceptionGuildRankings: []DivaRankingEntry{
+		{ID: 10, Name: "TestGuild", Score: 5553},
+	}}
 	session := createMockSession(1, server)
 
 	handleMsgMhfGetUdGuildMapInfo(session, &mhfpacket.MsgMhfGetUdGuildMapInfo{
@@ -836,11 +841,122 @@ func TestHandleMsgMhfGetUdGuildMapInfo(t *testing.T) {
 
 	select {
 	case p := <-session.sendPackets:
-		if len(p.data) == 0 {
-			t.Error("response should have data")
+		const dataOffset = 10
+		data := p.data[dataOffset:]
+		const expectedSize = 2 + 8 + 64*23 + 2 + 1 + 7 + (divaInterceptionAreaCount+1)*23 + 4
+		if len(data) != expectedSize {
+			t.Fatalf("Diva map payload size=%d, want %d", len(data), expectedSize)
+		}
+		if data[0] != 0 || data[1] != 1 {
+			t.Fatalf("Diva map header=% X, want status 0 and one map", data[:2])
+		}
+		if got := binary.BigEndian.Uint32(data[2:6]); got != divaInterceptionMapID {
+			t.Errorf("Diva map ID=%d, want %d", got, divaInterceptionMapID)
+		}
+		if got := binary.BigEndian.Uint16(data[10:12]); got != 501 {
+			t.Errorf("first area ID=%d, want 501", got)
+		}
+		if got := binary.BigEndian.Uint32(data[29:33]); got != 0 {
+			t.Errorf("first area reward key=%d, want zero", got)
+		}
+		lastArea := 10 + (divaInterceptionAreaCount-1)*23
+		if got := binary.BigEndian.Uint16(data[lastArea : lastArea+2]); got != 112 {
+			t.Errorf("last area ID=%d, want 112", got)
+		}
+		if got := binary.BigEndian.Uint32(data[lastArea+19 : lastArea+23]); got != 0 {
+			t.Errorf("last area reward key=%d, want zero", got)
+		}
+		for i := 0; i < 5; i++ {
+			if got := data[10+i*23+13]; got != 3 {
+				t.Errorf("reclaimed area %d state=%d, want Clan Territory state 3", i, got)
+			}
+		}
+		if got := data[10+5*23+13]; got != 1 {
+			t.Errorf("current target state=%d, want active target state 1", got)
+		}
+		if got := binary.BigEndian.Uint32(data[10+5*23+14 : 10+5*23+18]); got != 553 {
+			t.Errorf("current target map progress=%d, want 553", got)
+		}
+		padding := 10 + divaInterceptionAreaCount*23
+		if got := binary.BigEndian.Uint16(data[padding : padding+2]); got != divaInterceptionRouteAnchorID {
+			t.Fatalf("route anchor area ID=%d, want %d", got, divaInterceptionRouteAnchorID)
+		}
+		if got := data[padding+13]; got != 3 {
+			t.Fatalf("route anchor state=%d, want 3", got)
+		}
+		for i, value := range data[padding+23 : padding+4*23] {
+			if value != 0 {
+				t.Fatalf("remaining map padding byte %d=%d, want zero", i, value)
+			}
+		}
+		rewards := 10 + 64*23
+		if got := binary.BigEndian.Uint16(data[rewards : rewards+2]); got != 0 {
+			t.Fatalf("unverified reward definition count=%d, want zero", got)
+		}
+		topology := rewards + 2
+		if data[topology] != 1 || binary.BigEndian.Uint32(data[topology+1:topology+5]) != divaInterceptionMapID ||
+			binary.BigEndian.Uint16(data[topology+5:topology+7]) != 1 || data[topology+7] != divaInterceptionAreaCount+1 {
+			t.Fatalf("unexpected topology header: % X", data[topology:topology+8])
+		}
+		if got := binary.BigEndian.Uint16(data[topology+8+8 : topology+8+10]); got != 501 {
+			t.Errorf("first topology area ID=%d, want 501", got)
+		}
+		if got := binary.BigEndian.Uint16(data[topology+8+14 : topology+8+16]); got != 58043 {
+			t.Errorf("first topology quest ID=%d, want 58043", got)
+		}
+		if got := binary.BigEndian.Uint32(data[topology+8+16 : topology+8+20]); got != 0 {
+			t.Errorf("first topology unused quest slots=%08X, want zero", got)
+		}
+		for i := 0; i < 5; i++ {
+			completedTopology := topology + 8 + i*23
+			if got := binary.BigEndian.Uint32(data[completedTopology : completedTopology+4]); got != divaInterceptionAreaPointRequirement {
+				t.Errorf("completed topology %d progress=%d, want %d", i, got, divaInterceptionAreaPointRequirement)
+			}
+			if got := binary.BigEndian.Uint32(data[completedTopology+10 : completedTopology+14]); got != 0 {
+				t.Errorf("completed topology %d route must terminate, got %08X", i, got)
+			}
+		}
+		currentTopology := topology + 8 + 5*23
+		if got := binary.BigEndian.Uint32(data[currentTopology : currentTopology+4]); got != 553 {
+			t.Errorf("current target topology progress=%d, want 553", got)
+		}
+		if got := binary.BigEndian.Uint32(data[currentTopology+10 : currentTopology+14]); got != 0 {
+			t.Errorf("current target route must terminate, got %08X", got)
+		}
+		anchorTopology := topology + 8 + divaInterceptionAreaCount*23
+		if got := binary.BigEndian.Uint32(data[anchorTopology : anchorTopology+4]); got != divaInterceptionAreaPointRequirement {
+			t.Errorf("anchor topology progress=%d, want %d", got, divaInterceptionAreaPointRequirement)
+		}
+		if got := binary.BigEndian.Uint16(data[anchorTopology+8 : anchorTopology+10]); got != divaInterceptionRouteAnchorID {
+			t.Errorf("anchor topology area=%d, want %d", got, divaInterceptionRouteAnchorID)
+		}
+		if got := binary.BigEndian.Uint16(data[anchorTopology+10 : anchorTopology+12]); got != divaInterceptionRouteAnchorID {
+			t.Errorf("anchor route key=%d, want %d", got, divaInterceptionRouteAnchorID)
+		}
+		if got := binary.BigEndian.Uint16(data[anchorTopology+12 : anchorTopology+14]); got != 506 {
+			t.Errorf("anchor next area=%d, want 506", got)
+		}
+		if got := binary.BigEndian.Uint32(data[len(data)-4:]); got != 5 {
+			t.Errorf("reclaimed area count=%d, want 5", got)
 		}
 	default:
 		t.Error("no response queued")
+	}
+}
+
+func TestDivaInterceptionQuestMap(t *testing.T) {
+	if got := len(divaInterceptionQuestIDs); got != divaInterceptionAreaCount {
+		t.Fatalf("interception quest count=%d, want %d", got, divaInterceptionAreaCount)
+	}
+	seen := make(map[uint16]bool, len(divaInterceptionQuestIDs))
+	for _, questID := range divaInterceptionQuestIDs {
+		if questID >= 58079 && questID <= 58083 {
+			t.Errorf("branch quest %d must not be assigned to a battle cell", questID)
+		}
+		if seen[questID] {
+			t.Errorf("duplicate interception quest ID %d", questID)
+		}
+		seen[questID] = true
 	}
 }
 
@@ -958,6 +1074,7 @@ func TestHandleMsgMhfEntryRookieGuild(t *testing.T) {
 
 func TestHandleMsgMhfGenerateUdGuildMap(t *testing.T) {
 	server := createMockServer()
+	server.guildRepo = &mockGuildRepo{guild: &Guild{ID: 10, Name: "TestGuild"}}
 	session := createMockSession(1, server)
 
 	pkt := &mhfpacket.MsgMhfGenerateUdGuildMap{

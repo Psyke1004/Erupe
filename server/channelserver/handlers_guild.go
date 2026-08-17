@@ -249,7 +249,199 @@ func handleMsgMhfGetGuildManageRight(s *Session, p mhfpacket.MHFPacket) {
 
 func handleMsgMhfGetUdGuildMapInfo(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdGuildMapInfo)
-	doAckSimpleFail(s, pkt.AckHandle, make([]byte, 4))
+	guild, err := s.server.guildRepo.GetByCharID(s.charID)
+	if err != nil || guild == nil {
+		s.logger.Warn("Failed to resolve guild for Diva interception map",
+			zap.Uint32("charID", s.charID), zap.Error(err))
+		doAckBufFail(s, pkt.AckHandle, []byte{1})
+		return
+	}
+
+	guildScore := uint32(0)
+	if rankings, rankingErr := s.server.divaRepo.GetInterceptionGuildRankings(); rankingErr != nil {
+		s.logger.Warn("Failed to resolve Diva interception map score", zap.Error(rankingErr))
+	} else {
+		_, guildScore = findDivaRanking(rankings, guild.ID)
+	}
+	bf := buildDivaInterceptionMap(guildScore)
+	s.logger.Debug("Retrieved Diva interception map",
+		zap.Uint32("charID", s.charID),
+		zap.Uint32("guildID", guild.ID),
+		zap.Uint32("guildScore", guildScore),
+		zap.Int("reclaimedAreas", divaInterceptionReclaimedAreas(guildScore)),
+		zap.Int("areas", divaInterceptionAreaCount))
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
+}
+
+const divaInterceptionAreaCount = 60
+const divaInterceptionMapID = uint32(1)
+const divaInterceptionAreaPointRequirement = uint32(1000)
+const divaInterceptionRouteAnchorID = uint16(601)
+
+// divaInterceptionQuestIDs maps the 60 rendered interception cells to the 60
+// real battle quests seeded in EventQuests.sql. The five type-47 branch quests
+// (58079-58083, "path to treasure") are deliberately excluded: they describe
+// route transitions rather than a monster-base battle and therefore do not
+// belong in a selectable map cell.
+//
+// Keep this in the same order as the type-46/48 seed rows.
+var divaInterceptionQuestIDs = [divaInterceptionAreaCount]uint16{
+	58043,
+	58050, 58051, 58052, 58053, 58054, 58055, 58056, 58057, 58058, 58059,
+	58060, 58061, 58062, 58063, 58064, 58065, 58066, 58067, 58068, 58069,
+	58070, 58071, 58072, 58074, 58075, 58076, 58077, 58078,
+	58088, 58089, 58090, 58091,
+	58096, 58097, 58098, 58099,
+	58101, 58102, 58103, 58104, 58105, 58106, 58107, 58108, 58109,
+	58112, 58113, 58114, 58115,
+	58118, 58119, 58120, 58121, 58122, 58123,
+	58125, 58126, 58127, 58128,
+}
+
+func divaInterceptionReclaimedAreas(guildScore uint32) int {
+	reclaimed := int(guildScore / divaInterceptionAreaPointRequirement)
+	if reclaimed > divaInterceptionAreaCount {
+		return divaInterceptionAreaCount
+	}
+	return reclaimed
+}
+
+// divaInterceptionAreaID maps the client's 5x12 board coordinate to its retail
+// decimal area ID. The renderer reverses this as row=5-(id/100), col=id%100-1;
+// sequential IDs 1..60 therefore address row 5 outside the board.
+func divaInterceptionAreaID(index int) uint16 {
+	row := index / 12
+	column := index % 12
+	return uint16((5-row)*100 + column + 1)
+}
+
+func writeDivaInterceptionMapArea(bf *byteframe.ByteFrame, areaID uint16, state uint8, progress uint32) {
+	bf.WriteUint16(areaID)
+	// Five auxiliary u16 fields remain zero until their independent semantics
+	// are proven. They are not used by the selected-cell Quest display.
+	bf.WriteUint16(0)
+	bf.WriteUint16(0)
+	bf.WriteUint16(0)
+	bf.WriteUint16(0)
+	bf.WriteUint16(0)
+	bf.WriteUint8(0)
+	bf.WriteUint8(state)
+	bf.WriteUint32(progress)
+	bf.WriteUint8(0)
+	bf.WriteUint32(0) // no unverified per-cell reward table
+}
+
+func writeDivaInterceptionTopologyArea(
+	bf *byteframe.ByteFrame,
+	areaID uint16,
+	routeKey uint16,
+	nextAreaID uint16,
+	questIDs [3]uint16,
+	progress uint32,
+) {
+	// The route decoder stores these as the current and required point values.
+	bf.WriteUint32(progress)
+	bf.WriteUint32(divaInterceptionAreaPointRequirement)
+	// The first ID matches this topology row to its rendered map area. The
+	// client's route walker finds the completed frontier by routeKey, then uses
+	// nextAreaID as the newly available area. Only that one edge is emitted;
+	// the target row terminates at zero so traversal can never cycle.
+	bf.WriteUint16(areaID)
+	bf.WriteUint16(routeKey)
+	bf.WriteUint16(nextAreaID)
+	// The selected-cell panel resolves these through the client's quest title
+	// catalogue. They are quest IDs; monster IDs happen to resolve to unrelated
+	// normal-quest titles such as "Hunter Basics".
+	bf.WriteUint16(questIDs[0])
+	bf.WriteUint16(questIDs[1])
+	bf.WriteUint16(questIDs[2])
+	bf.WriteUint8(0)
+	bf.WriteUint8(0)
+	bf.WriteUint8(0)
+}
+
+// buildDivaInterceptionMap emits the exact structure decoded by mhfo.dll
+// 0x1150FB60. It contains one 60-cell 5x12 board plus the four mandatory zero
+// padding records in the fixed 64-record map array, and one matching topology
+// record. Omitting the topology or using IDs outside the decimal coordinate
+// range leaves the renderer unable to initialize its board.
+func buildDivaInterceptionMap(guildScore uint32) *byteframe.ByteFrame {
+	bf := byteframe.NewByteFrame()
+	reclaimed := divaInterceptionReclaimedAreas(guildScore)
+	currentProgress := guildScore % divaInterceptionAreaPointRequirement
+	bf.WriteUint8(0) // status: success
+	bf.WriteUint8(1) // one current map
+	// Both header IDs participate in the client's map/topology lineage lookup;
+	// they are map IDs rather than the database guild ID.
+	bf.WriteUint32(divaInterceptionMapID)
+	bf.WriteUint32(divaInterceptionMapID)
+	for i := 0; i < divaInterceptionAreaCount; i++ {
+		// State 3 is the client's reclaimed Clan Territory/Clan Advantage state.
+		// State 2 still renders an occupied icon but identifies the selected cell
+		// as a Monster Base. Completed topology rows terminate at zero route IDs,
+		// preventing the map-regeneration loop seen with linked state-2 rows.
+		state := uint8(0)
+		if i < reclaimed {
+			state = 3
+		} else if i == reclaimed && reclaimed < divaInterceptionAreaCount {
+			// State 1 exposes the next occupiable cell and its target icon. The
+			// current value is always below the requirement, so this cannot enter
+			// the completed-route traversal which previously stalled loading.
+			state = 1
+		}
+		progress := uint32(0)
+		if i == reclaimed && reclaimed < divaInterceptionAreaCount {
+			progress = currentProgress
+		}
+		writeDivaInterceptionMapArea(bf, divaInterceptionAreaID(i), state, progress)
+	}
+	// The client stores 64 map records but renders only the first 60 board
+	// coordinates. Use one padding record as the completed route origin that
+	// makes the current area reachable without altering its visible state.
+	writeDivaInterceptionMapArea(bf, divaInterceptionRouteAnchorID, 3, 0)
+	for i := divaInterceptionAreaCount + 1; i < 64; i++ {
+		bf.WriteBytes(make([]byte, 23))
+	}
+	bf.WriteUint16(0) // no per-cell reward definitions until retail data is known
+	bf.WriteUint8(1)  // one topology matching the current map
+	bf.WriteUint32(divaInterceptionMapID)
+	bf.WriteUint16(1)
+	bf.WriteUint8(divaInterceptionAreaCount + 1)
+	for i := 0; i < divaInterceptionAreaCount; i++ {
+		progress := uint32(0)
+		if i < reclaimed {
+			// State 3 needs a completed point value to render the visible Clan
+			// Territory icon. Its route key remains zero below, so the route walker
+			// terminates immediately and cannot form a cycle. Unlike state 2, this
+			// combination is not treated as a pending map-regeneration condition.
+			progress = divaInterceptionAreaPointRequirement
+		} else if i == reclaimed && reclaimed < divaInterceptionAreaCount {
+			progress = currentProgress
+		}
+		writeDivaInterceptionTopologyArea(
+			bf,
+			divaInterceptionAreaID(i),
+			0,
+			0,
+			[3]uint16{divaInterceptionQuestIDs[i], 0, 0},
+			progress,
+		)
+	}
+	nextAreaID := uint16(0)
+	if reclaimed < divaInterceptionAreaCount {
+		nextAreaID = divaInterceptionAreaID(reclaimed)
+	}
+	writeDivaInterceptionTopologyArea(
+		bf,
+		divaInterceptionRouteAnchorID,
+		divaInterceptionRouteAnchorID,
+		nextAreaID,
+		[3]uint16{},
+		divaInterceptionAreaPointRequirement,
+	)
+	// Displayed directly by the client as Acquired/Reclaimed Areas.
+	bf.WriteUint32(uint32(reclaimed))
+	return bf
 }
 
 func handleMsgMhfGetGuildTargetMemberNum(s *Session, p mhfpacket.MHFPacket) {
@@ -411,7 +603,17 @@ func handleMsgMhfUpdateForceGuildRank(s *Session, p mhfpacket.MHFPacket) {} // s
 
 func handleMsgMhfGenerateUdGuildMap(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGenerateUdGuildMap)
-	doAckSimpleFail(s, pkt.AckHandle, make([]byte, 4))
+	guild, err := s.server.guildRepo.GetByCharID(s.charID)
+	if err != nil || guild == nil {
+		s.logger.Warn("Failed to generate Diva interception map",
+			zap.Uint32("charID", s.charID), zap.Error(err))
+		doAckSimpleFail(s, pkt.AckHandle, []byte{1})
+		return
+	}
+	// The board is deterministic and reconstructed by GetUdGuildMapInfo. The
+	// generation command only needs to confirm that the requesting guild has a
+	// valid map identity; no speculative blob is persisted.
+	doAckSimpleSucceed(s, pkt.AckHandle, []byte{0})
 }
 
 func handleMsgMhfUpdateGuild(s *Session, p mhfpacket.MHFPacket) {} // stub: unimplemented

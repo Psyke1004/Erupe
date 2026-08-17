@@ -356,22 +356,39 @@ type DivaPrize struct {
 	Repeatable bool
 }
 
+// DivaRankingEntry is one event-scoped personal or guild ranking row.
+type DivaRankingEntry struct {
+	ID    uint32
+	Name  string
+	Score int64
+}
+
 // DivaRepo defines the contract for diva event data access.
 type DivaRepo interface {
 	DeleteEvents() error
 	InsertEvent(startEpoch uint32) error
 	GetEvents() ([]DivaEvent, error)
 	AddPoints(charID uint32, eventID uint32, questPoints, bonusPoints uint32) error
+	AddPointSubmission(charID uint32, eventID uint32, questPoints, bonusPoints uint32, beadIndex int) error
 	GetPoints(charID uint32, eventID uint32) (questPoints, bonusPoints int64, err error)
 	GetTotalPoints(eventID uint32) (questPoints, bonusPoints int64, err error)
+	GetPersonalRankings(eventID uint32) ([]DivaRankingEntry, error)
+	GetGuildRankings(eventID uint32) ([]DivaRankingEntry, error)
+	GetCharacterGuildID(characterID uint32) (uint32, error)
+	GetParticipationDays(characterID, eventID uint32, eventStart time.Time) ([]int, error)
+	TryClaimReward(eventID, characterID uint32, rewardType uint8, rewardKey string, itemID, quantity uint32) (bool, error)
+	MarkRewardDelivered(eventID, characterID uint32, rewardType uint8, rewardKey string) error
+	ReleaseRewardClaim(eventID, characterID uint32, rewardType uint8, rewardKey string) error
 
 	// Bead management
 	GetBeads() ([]int, error)
 	AssignBead(characterID uint32, beadIndex int, expiry time.Time) error
-	AddBeadPoints(characterID uint32, beadIndex int, points int) error
-	GetCharacterBeadPoints(characterID uint32) (map[int]int, error)
-	GetTotalBeadPoints() (int64, error)
-	GetTopBeadPerDay(day int) (int, error)
+	GetAssignedBead(characterID uint32, now time.Time) (int, error)
+	AddBeadPoints(characterID, eventID uint32, beadIndex int, points int) error
+	GetCharacterBeadPoints(characterID, eventID uint32) (map[int]int, error)
+	GetCharacterBeadPointEntries(characterID, eventID uint32) ([]DivaBeadPointEntry, error)
+	GetTotalBeadPoints(eventID uint32) (int64, error)
+	GetTopBeadPerDay(eventID uint32, eventStart time.Time, day int) (int, error)
 	CleanupBeads() error
 
 	// Prize rewards
@@ -381,6 +398,7 @@ type DivaRepo interface {
 	// Interception points (guild_characters.interception_points JSON)
 	GetCharacterInterceptionPoints(characterID uint32) (map[string]int, error)
 	AddInterceptionPoints(characterID uint32, questFileID int, points int) error
+	GetInterceptionGuildRankings() ([]DivaRankingEntry, error)
 }
 
 // MiscRepo defines the contract for miscellaneous data access.

@@ -611,11 +611,15 @@ func TestBatchParseMultiField(t *testing.T) {
 	t.Run("MsgMhfSetKiju", func(t *testing.T) {
 		bf := byteframe.NewByteFrame()
 		bf.WriteUint32(1) // AckHandle
-		bf.WriteUint16(5) // Unk1
+		bf.WriteUint8(2)  // zero-based UI slot
+		bf.WriteUint8(0)  // padding
 		_, _ = bf.Seek(0, io.SeekStart)
 		pkt := &MsgMhfSetKiju{}
 		if err := pkt.Parse(bf, ctx); err != nil {
 			t.Fatal(err)
+		}
+		if pkt.Unk1 != 2 {
+			t.Fatalf("Unk1=%d, want 2", pkt.Unk1)
 		}
 	})
 
