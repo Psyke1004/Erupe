@@ -14,6 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
@@ -443,14 +444,30 @@ func makeEventQuest(s *Session, eq EventQuest) ([]byte, error) {
 	return bf.Data(), nil
 }
 
+// prioritizeDivaEventQuests keeps the complete interception catalogue inside
+// the ZZ client's fixed 256-quest store. The current database contains more
+// than 256 valid event quests; the client stops requesting pages as it nears
+// that bound, which previously cut the catalogue at quest 58099 and omitted
+// every Zenith interception quest. Stable sorting preserves quest-ID order
+// within both the Diva and non-Diva groups.
+func prioritizeDivaEventQuests(quests []EventQuest) {
+	sort.SliceStable(quests, func(i, j int) bool {
+		return isDivaDefenseQuestType(quests[i].QuestType) &&
+			!isDivaDefenseQuestType(quests[j].QuestType)
+	})
+}
+
 func handleMsgMhfEnumerateQuest(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfEnumerateQuest)
 	var totalCount, returnedCount uint16
+	firstReturnedQuestID, lastReturnedQuestID := 0, 0
+	var returnedDivaG, returnedDivaZenith, returnedDivaBranch, returnedDivaUrgent uint16
 	bf := byteframe.NewByteFrame()
 	bf.WriteUint16(0)
 
 	quests, err := s.server.eventRepo.GetEventQuests()
 	if err == nil {
+		prioritizeDivaEventQuests(quests)
 		currentTime := time.Now()
 		var updates []EventQuestUpdate
 
@@ -493,6 +510,24 @@ func handleMsgMhfEnumerateQuest(s *Session, p mhfpacket.MHFPacket) {
 					totalCount++
 					if totalCount > pkt.Offset && len(bf.Data()) < 60000 {
 						returnedCount++
+						if firstReturnedQuestID == 0 {
+							firstReturnedQuestID = eq.QuestID
+						}
+						lastReturnedQuestID = eq.QuestID
+						if isDivaDefenseQuestType(eq.QuestType) {
+							switch eq.QuestType {
+							case QuestTypeDivaDefenseB:
+								returnedDivaBranch++
+							case QuestTypeDivaDefenseC:
+								returnedDivaUrgent++
+							default:
+								if len(data) > questFrameVariant3Offset && data[questFrameVariant3Offset]&0x10 != 0 {
+									returnedDivaZenith++
+								} else {
+									returnedDivaG++
+								}
+							}
+						}
 						bf.WriteBytes(data)
 						continue
 					}
@@ -744,6 +779,18 @@ func handleMsgMhfEnumerateQuest(s *Session, p mhfpacket.MHFPacket) {
 	bf.WriteUint16(pkt.Offset + returnedCount)
 	_, _ = bf.Seek(0, io.SeekStart)
 	bf.WriteUint16(returnedCount)
+	s.logger.Debug("Enumerated event quest page",
+		zap.Uint32("charID", s.charID),
+		zap.Uint16("requestOffset", pkt.Offset),
+		zap.Uint16("nextOffset", pkt.Offset+returnedCount),
+		zap.Uint16("totalCount", totalCount),
+		zap.Uint16("returnedCount", returnedCount),
+		zap.Int("firstQuestID", firstReturnedQuestID),
+		zap.Int("lastQuestID", lastReturnedQuestID),
+		zap.Uint16("divaG", returnedDivaG),
+		zap.Uint16("divaZenith", returnedDivaZenith),
+		zap.Uint16("divaBranch", returnedDivaBranch),
+		zap.Uint16("divaUrgent", returnedDivaUrgent))
 
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }

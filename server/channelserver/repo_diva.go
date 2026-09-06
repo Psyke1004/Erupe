@@ -2,7 +2,6 @@ package channelserver
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -404,65 +403,77 @@ func (r *DivaRepository) getPrizesByType(prizeType string) ([]DivaPrize, error) 
 	return prizes, rows.Err()
 }
 
-// GetCharacterInterceptionPoints returns the interception_points JSON map from guild_characters.
-func (r *DivaRepository) GetCharacterInterceptionPoints(characterID uint32) (map[string]int, error) {
-	var raw []byte
-	err := r.db.QueryRow(
-		"SELECT interception_points FROM guild_characters WHERE character_id=$1",
-		characterID).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return map[string]int{}, nil
-	}
+// GetCharacterInterceptionPoints returns one character's contributions for a
+// single Diva event, keyed by quest file ID for the existing handler contract.
+func (r *DivaRepository) GetCharacterInterceptionPoints(characterID, eventID uint32) (map[string]int, error) {
+	rows, err := r.db.Query(`
+		SELECT quest_file_id, points
+		FROM diva_interception_points
+		WHERE character_id=$1 AND event_id=$2`, characterID, eventID)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	result := make(map[string]int)
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &result); err != nil {
+	for rows.Next() {
+		var questFileID, points int
+		if err := rows.Scan(&questFileID, &points); err != nil {
 			return nil, err
 		}
+		result[fmt.Sprint(questFileID)] = points
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
-// AddInterceptionPoints increments the interception points for a quest file ID in guild_characters.
-func (r *DivaRepository) AddInterceptionPoints(characterID uint32, questFileID int, points int) error {
-	result, err := r.db.Exec(`
-		UPDATE guild_characters
-		SET interception_points = interception_points || jsonb_build_object(
-			$2::text,
-			COALESCE((interception_points->>$2::text)::int, 0) + $3
-		)
-		WHERE character_id=$1`,
-		characterID, questFileID, points)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return fmt.Errorf("Diva interception point update matched %d guild memberships for character %d", rows, characterID)
-	}
-	return nil
+// AddInterceptionPoints atomically increments one event/character/quest row.
+func (r *DivaRepository) AddInterceptionPoints(characterID, eventID uint32, questFileID int, points int) error {
+	_, err := r.db.Exec(`
+		INSERT INTO diva_interception_points
+			(event_id, character_id, quest_file_id, points)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (event_id, character_id, quest_file_id) DO UPDATE
+		SET points = diva_interception_points.points + EXCLUDED.points,
+			updated_at = now()`, eventID, characterID, questFileID, points)
+	return err
 }
 
-// GetInterceptionGuildRankings aggregates the second-week interception score
-// map across every current member of each guild. Unlike the first-week Diva
-// ranking, these points live in guild_characters.interception_points and are
-// not scoped by diva_points.event_id.
-func (r *DivaRepository) GetInterceptionGuildRankings() ([]DivaRankingEntry, error) {
+// GetInterceptionGuildMapScore returns only ordinary interception battle
+// points. Branch-to-treasure quest points have their own endpoint progress and
+// must not move the guild's main-route frontier.
+func (r *DivaRepository) GetInterceptionGuildMapScore(eventID, guildID uint32) (uint32, error) {
+	var score int64
+	err := r.db.Get(&score, `
+		SELECT COALESCE(SUM(point.points), 0)::bigint
+		FROM guild_characters gc
+		JOIN diva_interception_points point
+		  ON point.character_id = gc.character_id
+		 AND point.event_id = $1
+		WHERE gc.guild_id = $2
+		  AND point.quest_file_id NOT BETWEEN $3 AND $4`,
+		eventID,
+		guildID,
+		divaInterceptionBranchQuestIDs[0],
+		divaInterceptionBranchQuestIDs[len(divaInterceptionBranchQuestIDs)-1],
+	)
+	if err != nil {
+		return 0, err
+	}
+	return divaRankingScore(score), nil
+}
+
+// GetInterceptionGuildRankings aggregates only the requested Diva event across
+// every current member of each guild.
+func (r *DivaRepository) GetInterceptionGuildRankings(eventID uint32) ([]DivaRankingEntry, error) {
 	var result []DivaRankingEntry
 	err := r.db.Select(&result, `
-		SELECT g.id, g.name, SUM(point.value::bigint)::bigint AS score
+		SELECT g.id, g.name, SUM(point.points)::bigint AS score
 		FROM guild_characters gc
 		JOIN guilds g ON g.id = gc.guild_id
-		JOIN LATERAL jsonb_each_text(
-			COALESCE(gc.interception_points, '{}'::jsonb)
-		) AS point(key, value) ON TRUE
+		JOIN diva_interception_points point
+		  ON point.character_id = gc.character_id
+		 AND point.event_id = $1
 		GROUP BY g.id, g.name
-		HAVING SUM(point.value::bigint) > 0
-		ORDER BY score DESC, g.id ASC`)
+		HAVING SUM(point.points) > 0
+		ORDER BY score DESC, g.id ASC`, eventID)
 	return result, err
 }

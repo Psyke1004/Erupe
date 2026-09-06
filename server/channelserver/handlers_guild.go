@@ -2,6 +2,7 @@ package channelserver
 
 import (
 	"sort"
+	"strconv"
 	"time"
 
 	"erupe-ce/common/byteframe"
@@ -258,25 +259,47 @@ func handleMsgMhfGetUdGuildMapInfo(s *Session, p mhfpacket.MHFPacket) {
 	}
 
 	guildScore := uint32(0)
-	if rankings, rankingErr := s.server.divaRepo.GetInterceptionGuildRankings(); rankingErr != nil {
-		s.logger.Warn("Failed to resolve Diva interception map score", zap.Error(rankingErr))
+	branchProgress := uint32(0)
+	eventID, eventErr := getCurrentDivaEventID(s)
+	route := buildDivaInterceptionRoute(eventID, guild.ID)
+	if eventErr != nil {
+		s.logger.Warn("Failed to resolve current Diva event for interception map", zap.Error(eventErr))
+	} else if eventID == 0 {
+		s.logger.Warn("No current Diva event for interception map", zap.Uint32("charID", s.charID))
 	} else {
-		_, guildScore = findDivaRanking(rankings, guild.ID)
+		var scoreErr error
+		guildScore, scoreErr = s.server.divaRepo.GetInterceptionGuildMapScore(eventID, guild.ID)
+		if scoreErr != nil {
+			s.logger.Warn("Failed to resolve Diva interception map score", zap.Error(scoreErr))
+		}
+		points, pointsErr := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID, eventID)
+		if pointsErr != nil {
+			s.logger.Warn("Failed to resolve Diva interception branch progress", zap.Error(pointsErr))
+		} else {
+			branchProgress = divaInterceptionBranchProgress(points, route)
+		}
 	}
-	bf := buildDivaInterceptionMap(guildScore)
+	reclaimedAreas := divaInterceptionReclaimedAreas(guildScore, len(route.areaIndexes))
+	branchUnlocked := route.branchFromPosition >= 0 && reclaimedAreas > route.branchFromPosition
+	bf := buildDivaInterceptionMap(guildScore, branchProgress, route)
 	s.logger.Debug("Retrieved Diva interception map",
 		zap.Uint32("charID", s.charID),
 		zap.Uint32("guildID", guild.ID),
 		zap.Uint32("guildScore", guildScore),
-		zap.Int("reclaimedAreas", divaInterceptionReclaimedAreas(guildScore)),
-		zap.Int("areas", divaInterceptionAreaCount))
+		zap.Uint32("branchProgress", branchProgress),
+		zap.Int("reclaimedAreas", reclaimedAreas),
+		zap.Int("routeAreas", len(route.areaIndexes)),
+		zap.Int("branchFromPosition", route.branchFromPosition),
+		zap.Int("branchAreas", len(route.branchAreaIndexes)),
+		zap.Bool("branchUnlocked", branchUnlocked))
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 const divaInterceptionAreaCount = 60
 const divaInterceptionMapID = uint32(1)
 const divaInterceptionAreaPointRequirement = uint32(1000)
-const divaInterceptionRouteAnchorID = uint16(601)
+const divaInterceptionSpecialRewardKey = uint32(1)
+const divaInterceptionSpecialClass = uint8(2)
 
 // divaInterceptionQuestIDs maps the 60 rendered interception cells to the 60
 // real battle quests seeded in EventQuests.sql. The five type-47 branch quests
@@ -298,12 +321,165 @@ var divaInterceptionQuestIDs = [divaInterceptionAreaCount]uint16{
 	58125, 58126, 58127, 58128,
 }
 
-func divaInterceptionReclaimedAreas(guildScore uint32) int {
+// These type-47 quests are the retail "path to treasure" branch quests. A
+// branch endpoint receives one of them instead of borrowing a normal
+// interception battle quest.
+var divaInterceptionBranchQuestIDs = [...]uint16{58079, 58080, 58081, 58082, 58083}
+
+// divaInterceptionBranchQuestID is shared by the board and the NPC bonus-quest
+// list. Keeping the choice in one place prevents a visible treasure endpoint
+// from advertising a different quest than the one the NPC offers.
+func divaInterceptionBranchQuestID(route divaInterceptionRoute) (uint16, bool) {
+	if route.branchFromPosition < 0 || len(route.branchAreaIndexes) == 0 {
+		return 0, false
+	}
+	endpointPosition := len(route.branchAreaIndexes) - 1
+	questIndex := (route.branchFromPosition + endpointPosition) % len(divaInterceptionBranchQuestIDs)
+	return divaInterceptionBranchQuestIDs[questIndex], true
+}
+
+func divaInterceptionBranchProgress(points map[string]int, route divaInterceptionRoute) uint32 {
+	questID, ok := divaInterceptionBranchQuestID(route)
+	if !ok {
+		return 0
+	}
+	value := points[strconv.Itoa(int(questID))]
+	if value <= 0 {
+		return 0
+	}
+	if value >= int(divaInterceptionAreaPointRequirement) {
+		return divaInterceptionAreaPointRequirement
+	}
+	return uint32(value)
+}
+
+func divaInterceptionReclaimedAreas(guildScore uint32, areaCount int) int {
 	reclaimed := int(guildScore / divaInterceptionAreaPointRequirement)
-	if reclaimed > divaInterceptionAreaCount {
-		return divaInterceptionAreaCount
+	if reclaimed > areaCount {
+		return areaCount
 	}
 	return reclaimed
+}
+
+// divaInterceptionRoute is generated deterministically from the current event
+// and guild. It therefore looks random between events/guilds but never changes
+// merely because the board was reopened or the server restarted.
+type divaInterceptionRoute struct {
+	areaIndexes        []int
+	branchFromPosition int
+	branchAreaIndexes  []int
+}
+
+type divaInterceptionRouteRNG uint32
+
+func (r *divaInterceptionRouteRNG) next() uint32 {
+	x := uint32(*r)
+	x ^= x << 13
+	x ^= x >> 17
+	x ^= x << 5
+	*r = divaInterceptionRouteRNG(x)
+	return x
+}
+
+func buildDivaInterceptionRoute(eventID, guildID uint32) divaInterceptionRoute {
+	seed := eventID*0x9e3779b9 ^ guildID*0x85ebca6b ^ 0xd1b54a35
+	if seed == 0 {
+		seed = 0x6d2b79f5
+	}
+	rng := divaInterceptionRouteRNG(seed)
+
+	// Keep the start and goal on the visible upper corners, matching the retail
+	// reference. Reserve two horizontal cells after the start so the large
+	// hunter-base panel and the frontier actor/progress bar do not overlap during
+	// the first few captures.
+	areaIndexes := make([]int, 0, 27)
+	appendCell := func(row, column int) {
+		areaIndexes = append(areaIndexes, row*12+column)
+	}
+	appendCell(0, 0)
+	appendCell(0, 1)
+	appendCell(0, 2)
+	row := 1
+	appendCell(row, 2)
+	// Advance exactly one column at a time and make at most one vertical step in
+	// each intermediate column. This produces a thin 21-25-cell zig-zag instead
+	// of five adjacent horizontal bands, leaving 35-39 true blank cells.
+	for column := 3; column <= 11; column++ {
+		appendCell(row, column)
+		if column == 11 {
+			for row > 0 {
+				row--
+				appendCell(row, column)
+			}
+			break
+		}
+		switch row {
+		case 0:
+			row++
+		case 4:
+			row--
+		default:
+			if rng.next()&1 == 0 {
+				row--
+			} else {
+				row++
+			}
+		}
+		appendCell(row, column)
+	}
+
+	// Add a short optional spur near the middle of the main route. Its final
+	// cell is the treasure panel. Keeping these cells out of areaIndexes is
+	// important: optional treasure progress must not advance Acquired Areas or
+	// move the ordinary interception frontier.
+	used := [divaInterceptionAreaCount]bool{}
+	for _, areaIndex := range areaIndexes {
+		used[areaIndex] = true
+	}
+	branchFromPosition := -1
+	branchAreaIndexes := make([]int, 0, 2)
+	center := len(areaIndexes) / 2
+	for distance := 0; distance < len(areaIndexes) && branchFromPosition < 0; distance++ {
+		positions := [2]int{center - distance, center + distance}
+		for _, position := range positions {
+			if position < 4 || position >= len(areaIndexes)-3 {
+				continue
+			}
+			origin := areaIndexes[position]
+			row, column := origin/12, origin%12
+			rowDirections := [2]int{-1, 1}
+			if rng.next()&1 != 0 {
+				rowDirections = [2]int{1, -1}
+			}
+			columnDirection := 1
+			if column == 11 {
+				columnDirection = -1
+			}
+			for _, rowDirection := range rowDirections {
+				branchRow := row + rowDirection
+				branchColumn := column + columnDirection
+				if branchRow < 0 || branchRow >= 5 || branchColumn < 0 || branchColumn >= 12 {
+					continue
+				}
+				first := branchRow*12 + column
+				second := branchRow*12 + branchColumn
+				if used[first] || used[second] {
+					continue
+				}
+				branchFromPosition = position
+				branchAreaIndexes = append(branchAreaIndexes, first, second)
+				break
+			}
+			if branchFromPosition >= 0 {
+				break
+			}
+		}
+	}
+	return divaInterceptionRoute{
+		areaIndexes:        areaIndexes,
+		branchFromPosition: branchFromPosition,
+		branchAreaIndexes:  branchAreaIndexes,
+	}
 }
 
 // divaInterceptionAreaID maps the client's 5x12 board coordinate to its retail
@@ -315,10 +491,14 @@ func divaInterceptionAreaID(index int) uint16 {
 	return uint16((5-row)*100 + column + 1)
 }
 
-func writeDivaInterceptionMapArea(bf *byteframe.ByteFrame, areaID uint16, state uint8, progress uint32) {
+func writeDivaInterceptionMapArea(
+	bf *byteframe.ByteFrame,
+	areaID uint16,
+	state uint8,
+	progress uint32,
+	rewardKey uint32,
+) {
 	bf.WriteUint16(areaID)
-	// Five auxiliary u16 fields remain zero until their independent semantics
-	// are proven. They are not used by the selected-cell Quest display.
 	bf.WriteUint16(0)
 	bf.WriteUint16(0)
 	bf.WriteUint16(0)
@@ -328,7 +508,21 @@ func writeDivaInterceptionMapArea(bf *byteframe.ByteFrame, areaID uint16, state 
 	bf.WriteUint8(state)
 	bf.WriteUint32(progress)
 	bf.WriteUint8(0)
-	bf.WriteUint32(0) // no unverified per-cell reward table
+	bf.WriteUint32(rewardKey)
+}
+
+func writeDivaInterceptionSpecialRewardDefinition(bf *byteframe.ByteFrame, rewardKey uint32, class uint8) {
+	// The DX9 decoder expands this 14-byte wire record to 16 bytes. Client
+	// helpers match key and inclusive topology-header range, then classify the
+	// panel from the final byte. Class 2 is the treasure-panel family. Clan and
+	// monster bases are raw map states 1 and 2, not class-1 reward overlays.
+	bf.WriteUint32(rewardKey)
+	bf.WriteUint8(divaRewardItemType)
+	bf.WriteUint16(divaRewardItemID)
+	bf.WriteUint16(divaRewardQuantity)
+	bf.WriteUint16(1) // inclusive topology-header minimum
+	bf.WriteUint16(1) // inclusive topology-header maximum
+	bf.WriteUint8(class)
 }
 
 func writeDivaInterceptionTopologyArea(
@@ -338,14 +532,15 @@ func writeDivaInterceptionTopologyArea(
 	nextAreaID uint16,
 	questIDs [3]uint16,
 	progress uint32,
+	plainRenderOrder uint8,
 ) {
 	// The route decoder stores these as the current and required point values.
 	bf.WriteUint32(progress)
 	bf.WriteUint32(divaInterceptionAreaPointRequirement)
-	// The first ID matches this topology row to its rendered map area. The
-	// client's route walker finds the completed frontier by routeKey, then uses
-	// nextAreaID as the newly available area. Only that one edge is emitted;
-	// the target row terminates at zero so traversal can never cycle.
+	// The first ID matches this topology row to its rendered map area. Static
+	// analysis of the DX9 client proves that routeKey and nextAreaID are copied
+	// into the visible 40-byte board record. A completed cell whose routeKey is
+	// its own area ID exposes nextAreaID as its immediate reachable successor.
 	bf.WriteUint16(areaID)
 	bf.WriteUint16(routeKey)
 	bf.WriteUint16(nextAreaID)
@@ -355,90 +550,243 @@ func writeDivaInterceptionTopologyArea(
 	bf.WriteUint16(questIDs[0])
 	bf.WriteUint16(questIDs[1])
 	bf.WriteUint16(questIDs[2])
-	bf.WriteUint8(0)
+	// The first trailing byte is the one-based render slot for a topology row
+	// without quest IDs. The DX9 client derives slots for quest-bearing rows
+	// itself, placing them after every plain row. Leaving all plain slots zero
+	// collapses them into the sentinel entry before the visible pointer array;
+	// frontier selection then stays at (-1,-1), which is drawn as the detached
+	// lower-right outline, and the contact actors never follow progress.
+	bf.WriteUint8(plainRenderOrder)
 	bf.WriteUint8(0)
 	bf.WriteUint8(0)
 }
 
-// buildDivaInterceptionMap emits the exact structure decoded by mhfo.dll
-// 0x1150FB60. It contains one 60-cell 5x12 board plus the four mandatory zero
-// padding records in the fixed 64-record map array, and one matching topology
-// record. Omitting the topology or using IDs outside the decimal coordinate
-// range leaves the renderer unable to initialize its board.
-func buildDivaInterceptionMap(guildScore uint32) *byteframe.ByteFrame {
+// divaInterceptionMapRecordOrder preserves the fixed base record first, then
+// promotes an unlocked branch approach ahead of ordinary coordinate order.
+// The DX9 board builder places cells by their serialized area ID, so changing
+// the wire-record order does not move any rendered hex. Its local available-
+// quest walker, however, scans the raw 64-record array in wire order and stops
+// after ten reachable successors. Without this promotion, a long reclaimed
+// main route can fill that limit before the branch approach is examined.
+func divaInterceptionMapRecordOrder(route divaInterceptionRoute, branchUnlocked bool) []int {
+	order := make([]int, 0, divaInterceptionAreaCount)
+	promoted := [divaInterceptionAreaCount]bool{}
+	order = append(order, 0)
+	promoted[0] = true
+	if branchUnlocked {
+		for position, areaIndex := range route.branchAreaIndexes {
+			if position == len(route.branchAreaIndexes)-1 {
+				break // the final branch cell is the neutral treasure endpoint
+			}
+			if areaIndex < 0 || areaIndex >= divaInterceptionAreaCount || promoted[areaIndex] {
+				continue
+			}
+			order = append(order, areaIndex)
+			promoted[areaIndex] = true
+		}
+	}
+	for areaIndex := 1; areaIndex < divaInterceptionAreaCount; areaIndex++ {
+		if promoted[areaIndex] {
+			continue
+		}
+		order = append(order, areaIndex)
+	}
+	return order
+}
+
+// buildDivaInterceptionMap emits the wire structure consumed by the ZZ Diva
+// map UI. It contains one 60-cell 5x12 board plus the four mandatory records
+// in the client's fixed 64-record map array, and one matching topology record.
+// Omitting the topology or using IDs outside the decimal coordinate range
+// leaves the renderer unable to initialize its board. Do not attach a fixed
+// decoder address here: mhfo.dll and mhfo-hd.dll use different layouts and the
+// address also changes between client builds.
+func buildDivaInterceptionMap(guildScore, branchProgress uint32, route divaInterceptionRoute) *byteframe.ByteFrame {
 	bf := byteframe.NewByteFrame()
-	reclaimed := divaInterceptionReclaimedAreas(guildScore)
+	reclaimed := divaInterceptionReclaimedAreas(guildScore, len(route.areaIndexes))
 	currentProgress := guildScore % divaInterceptionAreaPointRequirement
+	// Once the route is complete there is no successor row that can represent
+	// the hunter/monster contact. If every row is emitted as completed, the
+	// client fails to find a plain active topology row and falls back to the Clan
+	// Base at the start of the board. Keep the terminal Monster Base as that
+	// active row and cycle its gauge with any points earned after arrival.
+	routeComplete := len(route.areaIndexes) > 0 && reclaimed == len(route.areaIndexes)
+	terminalPosition := len(route.areaIndexes) - 1
+	branchUnlocked := route.branchFromPosition >= 0 && reclaimed > route.branchFromPosition
+	if branchProgress > divaInterceptionAreaPointRequirement {
+		branchProgress = divaInterceptionAreaPointRequirement
+	}
+	branchComplete := branchUnlocked && branchProgress >= divaInterceptionAreaPointRequirement
+	positions := [divaInterceptionAreaCount]int{}
+	for i := range positions {
+		positions[i] = -1
+	}
+	for position, areaIndex := range route.areaIndexes {
+		positions[areaIndex] = position
+	}
+	branchPositions := [divaInterceptionAreaCount]int{}
+	for i := range branchPositions {
+		branchPositions[i] = -1
+	}
+	for position, areaIndex := range route.branchAreaIndexes {
+		branchPositions[areaIndex] = position
+	}
 	bf.WriteUint8(0) // status: success
 	bf.WriteUint8(1) // one current map
 	// Both header IDs participate in the client's map/topology lineage lookup;
 	// they are map IDs rather than the database guild ID.
 	bf.WriteUint32(divaInterceptionMapID)
 	bf.WriteUint32(divaInterceptionMapID)
-	for i := 0; i < divaInterceptionAreaCount; i++ {
-		// State 3 is the client's reclaimed Clan Territory/Clan Advantage state.
-		// State 2 still renders an occupied icon but identifies the selected cell
-		// as a Monster Base. Completed topology rows terminate at zero route IDs,
-		// preventing the map-regeneration loop seen with linked state-2 rows.
+	for _, i := range divaInterceptionMapRecordOrder(route, branchUnlocked) {
+		position := positions[i]
+		branchPosition := branchPositions[i]
+		// See docs/diva-interception-map.md before changing these values. Live
+		// comparison proves state 1 is the fixed Clan Base, state 2 is the
+		// uncaptured Monster Base, and state 3 is reclaimed Clan Territory. The
+		// moving contact is resolved from topology progress/render order, so the
+		// active map cell remains state 0.
 		state := uint8(0)
-		if i < reclaimed {
-			state = 3
-		} else if i == reclaimed && reclaimed < divaInterceptionAreaCount {
-			// State 1 exposes the next occupiable cell and its target icon. The
-			// current value is always below the requirement, so this cannot enter
-			// the completed-route traversal which previously stalled loading.
+		if position == 0 {
 			state = 1
+		} else if routeComplete && position == terminalPosition {
+			state = 2
+		} else if position > 0 && position < reclaimed {
+			state = 3
+		} else if position == len(route.areaIndexes)-1 && position >= reclaimed && reclaimed < len(route.areaIndexes) {
+			state = 2
+		}
+		// Once the main route has reclaimed the branch origin, expose the short
+		// approach to the treasure endpoint as reclaimed territory. The endpoint
+		// itself changes to reclaimed only after its branch quest has supplied the
+		// required points.
+		if branchUnlocked && branchPosition >= 0 && branchPosition < len(route.branchAreaIndexes)-1 {
+			state = 3
+		} else if branchComplete && branchPosition == len(route.branchAreaIndexes)-1 {
+			state = 3
 		}
 		progress := uint32(0)
-		if i == reclaimed && reclaimed < divaInterceptionAreaCount {
+		if routeComplete && position == terminalPosition {
+			progress = currentProgress
+		} else if position >= 0 && position < reclaimed {
+			// The map record and its topology row are two independent progress
+			// inputs to the client renderer. Leaving completed map progress at
+			// zero keeps the hunter/monster contact presentation pinned to an
+			// already reclaimed cell even though topology has advanced.
+			progress = divaInterceptionAreaPointRequirement
+		} else if position == reclaimed && reclaimed < len(route.areaIndexes) {
 			progress = currentProgress
 		}
-		writeDivaInterceptionMapArea(bf, divaInterceptionAreaID(i), state, progress)
+		if branchUnlocked && branchPosition >= 0 && branchPosition < len(route.branchAreaIndexes)-1 {
+			progress = divaInterceptionAreaPointRequirement
+		} else if branchUnlocked && branchPosition == len(route.branchAreaIndexes)-1 {
+			progress = branchProgress
+		}
+		rewardKey := uint32(0)
+		if branchPosition >= 0 && branchPosition == len(route.branchAreaIndexes)-1 {
+			rewardKey = divaInterceptionSpecialRewardKey
+		}
+		writeDivaInterceptionMapArea(bf, divaInterceptionAreaID(i), state, progress, rewardKey)
 	}
-	// The client stores 64 map records but renders only the first 60 board
-	// coordinates. Use one padding record as the completed route origin that
-	// makes the current area reachable without altering its visible state.
-	writeDivaInterceptionMapArea(bf, divaInterceptionRouteAnchorID, 3, 0)
-	for i := divaInterceptionAreaCount + 1; i < 64; i++ {
-		bf.WriteBytes(make([]byte, 23))
+	// The decoder always consumes 64 map records; the last four are padding.
+	var emptyMapRecord [23]byte
+	for i := divaInterceptionAreaCount; i < 64; i++ {
+		bf.WriteBytes(emptyMapRecord[:])
 	}
-	bf.WriteUint16(0) // no per-cell reward definitions until retail data is known
-	bf.WriteUint8(1)  // one topology matching the current map
+	bf.WriteUint16(1)
+	writeDivaInterceptionSpecialRewardDefinition(
+		bf,
+		divaInterceptionSpecialRewardKey,
+		divaInterceptionSpecialClass,
+	)
+	bf.WriteUint8(1) // one topology matching the current map
 	bf.WriteUint32(divaInterceptionMapID)
 	bf.WriteUint16(1)
-	bf.WriteUint8(divaInterceptionAreaCount + 1)
-	for i := 0; i < divaInterceptionAreaCount; i++ {
+	bf.WriteUint8(uint8(len(route.areaIndexes) + len(route.branchAreaIndexes)))
+	plainRenderOrder := uint8(1)
+	for position, areaIndex := range route.areaIndexes {
 		progress := uint32(0)
-		if i < reclaimed {
-			// State 3 needs a completed point value to render the visible Clan
-			// Territory icon. Its route key remains zero below, so the route walker
-			// terminates immediately and cannot form a cycle. Unlike state 2, this
-			// combination is not treated as a pending map-regeneration condition.
-			progress = divaInterceptionAreaPointRequirement
-		} else if i == reclaimed && reclaimed < divaInterceptionAreaCount {
+		if routeComplete && position == terminalPosition {
 			progress = currentProgress
+		} else if position < reclaimed {
+			// State 3 needs a completed point value to render the visible Clan
+			// Territory icon.
+			progress = divaInterceptionAreaPointRequirement
+		} else if position == reclaimed && reclaimed < len(route.areaIndexes) {
+			progress = currentProgress
+		}
+		nextAreaID := uint16(0)
+		if position+1 < len(route.areaIndexes) {
+			nextAreaID = divaInterceptionAreaID(route.areaIndexes[position+1])
+		}
+		areaID := divaInterceptionAreaID(areaIndex)
+		questIDs := [3]uint16{}
+		if position < reclaimed && !(routeComplete && position == terminalPosition) {
+			// Captured cells expose their battle quest. The active contact must stay
+			// a plain row so it receives runtime render slot 1 and supplies the
+			// contact actors/bar with its partial progress. The actual interception
+			// quest list is delivered independently from this board metadata.
+			// Ordinary future cells also use zero quest IDs for the yellow enemy-path
+			// presentation. The future bonus cell is the one exception: class-2 special presentation
+			// and a yellow base cell both map to client state 7, which hides the
+			// chest. Giving only that cell quest metadata changes its base display
+			// state while leaving the class-2 chest overlay independently visible.
+			questIDs[0] = divaInterceptionQuestIDs[position]
+		}
+		renderOrder := uint8(0)
+		if questIDs == [3]uint16{} {
+			renderOrder = plainRenderOrder
+			plainRenderOrder++
 		}
 		writeDivaInterceptionTopologyArea(
 			bf,
-			divaInterceptionAreaID(i),
-			0,
-			0,
-			[3]uint16{divaInterceptionQuestIDs[i], 0, 0},
+			areaID,
+			areaID,
+			nextAreaID,
+			questIDs,
 			progress,
+			renderOrder,
 		)
 	}
-	nextAreaID := uint16(0)
-	if reclaimed < divaInterceptionAreaCount {
-		nextAreaID = divaInterceptionAreaID(reclaimed)
+	for position, areaIndex := range route.branchAreaIndexes {
+		routeKey := divaInterceptionAreaID(route.areaIndexes[route.branchFromPosition])
+		if position > 0 {
+			routeKey = divaInterceptionAreaID(route.branchAreaIndexes[position-1])
+		}
+		nextAreaID := uint16(0)
+		if position+1 < len(route.branchAreaIndexes) {
+			nextAreaID = divaInterceptionAreaID(route.branchAreaIndexes[position+1])
+		}
+		questIDs := [3]uint16{}
+		if position == len(route.branchAreaIndexes)-1 && !branchComplete {
+			if questID, ok := divaInterceptionBranchQuestID(route); ok {
+				questIDs[0] = questID
+			}
+		}
+		renderOrder := uint8(0)
+		if questIDs == [3]uint16{} {
+			renderOrder = plainRenderOrder
+			plainRenderOrder++
+		}
+		// The client builds the Branch Route quest list locally. Static analysis
+		// of mhfo-hd.dll 0x103B99C0 shows that it only follows a reclaimed map
+		// cell when the successor topology row has progress >= required_points;
+		// it then reads the quest IDs from that successor. Mark every branch
+		// topology row reachable after the main-route origin is reclaimed, while
+		// leaving the endpoint map record at zero for future branch-quest points.
+		progress := uint32(0)
+		if branchUnlocked {
+			progress = divaInterceptionAreaPointRequirement
+		}
+		writeDivaInterceptionTopologyArea(
+			bf,
+			divaInterceptionAreaID(areaIndex),
+			routeKey,
+			nextAreaID,
+			questIDs,
+			progress,
+			renderOrder,
+		)
 	}
-	writeDivaInterceptionTopologyArea(
-		bf,
-		divaInterceptionRouteAnchorID,
-		divaInterceptionRouteAnchorID,
-		nextAreaID,
-		[3]uint16{},
-		divaInterceptionAreaPointRequirement,
-	)
 	// Displayed directly by the client as Acquired/Reclaimed Areas.
 	bf.WriteUint32(uint32(reclaimed))
 	return bf

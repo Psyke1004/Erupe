@@ -395,10 +395,12 @@ type DivaRepo interface {
 	GetPersonalPrizes() ([]DivaPrize, error)
 	GetGuildPrizes() ([]DivaPrize, error)
 
-	// Interception points (guild_characters.interception_points JSON)
-	GetCharacterInterceptionPoints(characterID uint32) (map[string]int, error)
-	AddInterceptionPoints(characterID uint32, questFileID int, points int) error
-	GetInterceptionGuildRankings() ([]DivaRankingEntry, error)
+	// Interception points are scoped to a Diva event so a new event never
+	// inherits the previous event's map, ranking, or reward progress.
+	GetCharacterInterceptionPoints(characterID, eventID uint32) (map[string]int, error)
+	AddInterceptionPoints(characterID, eventID uint32, questFileID int, points int) error
+	GetInterceptionGuildMapScore(eventID, guildID uint32) (uint32, error)
+	GetInterceptionGuildRankings(eventID uint32) ([]DivaRankingEntry, error)
 }
 
 // MiscRepo defines the contract for miscellaneous data access.

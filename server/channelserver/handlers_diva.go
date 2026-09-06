@@ -1,13 +1,13 @@
 package channelserver
 
 import (
-	"erupe-ce/common/stringsupport"
-	cfg "erupe-ce/config"
 	"fmt"
 	"sort"
 	"time"
 
 	"erupe-ce/common/byteframe"
+	"erupe-ce/common/stringsupport"
+	cfg "erupe-ce/config"
 	"erupe-ce/network/mhfpacket"
 	"go.uber.org/zap"
 )
@@ -20,6 +20,20 @@ const (
 	divaTotalLifespan = 2977200     // ~34.5 days = full event window
 )
 
+// divaTimestampsFromStart is the side-effect-free form of the schedule sent to
+// the client. Read-only handlers use it so checking an availability window can
+// never rotate the event or mutate the database.
+func divaTimestampsFromStart(start uint32) []uint32 {
+	timestamps := make([]uint32, 6)
+	timestamps[0] = start
+	timestamps[1] = timestamps[0] + divaPhaseDuration
+	timestamps[2] = timestamps[1] + divaInterlude
+	timestamps[3] = timestamps[1] + divaWeekDuration
+	timestamps[4] = timestamps[3] + divaInterlude
+	timestamps[5] = timestamps[3] + divaWeekDuration
+	return timestamps
+}
+
 func cleanupDiva(s *Session) {
 	if err := s.server.divaRepo.DeleteEvents(); err != nil {
 		s.logger.Error("Failed to delete diva events", zap.Error(err))
@@ -30,10 +44,9 @@ func cleanupDiva(s *Session) {
 }
 
 func generateDivaTimestamps(s *Session, start uint32, debug bool) []uint32 {
-	timestamps := make([]uint32, 6)
-	midnight := TimeMidnight()
 	if debug && start <= 3 {
-		midnight := uint32(midnight.Unix())
+		timestamps := make([]uint32, 6)
+		midnight := uint32(TimeMidnight().Unix())
 		switch start {
 		case 1:
 			timestamps[0] = midnight
@@ -62,18 +75,12 @@ func generateDivaTimestamps(s *Session, start uint32, debug bool) []uint32 {
 	if start == 0 || TimeAdjusted().Unix() > int64(start)+divaTotalLifespan {
 		cleanupDiva(s)
 		// Generate a new diva defense, starting midnight tomorrow
-		start = uint32(midnight.Add(24 * time.Hour).Unix())
+		start = uint32(TimeMidnight().Add(24 * time.Hour).Unix())
 		if err := s.server.divaRepo.InsertEvent(start); err != nil {
 			s.logger.Error("Failed to insert diva event", zap.Error(err))
 		}
 	}
-	timestamps[0] = start
-	timestamps[1] = timestamps[0] + divaPhaseDuration
-	timestamps[2] = timestamps[1] + divaInterlude
-	timestamps[3] = timestamps[1] + divaWeekDuration
-	timestamps[4] = timestamps[3] + divaInterlude
-	timestamps[5] = timestamps[3] + divaWeekDuration
-	return timestamps
+	return divaTimestampsFromStart(start)
 }
 
 func handleMsgMhfGetUdSchedule(s *Session, p mhfpacket.MHFPacket) {
@@ -649,7 +656,7 @@ func divaRewardKeys(s *Session, event DivaEvent, rewardType uint8) ([]string, er
 		}
 		return []string{"participation"}, nil
 	case 6: // interception personal achievement
-		points, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID)
+		points, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID, event.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -688,7 +695,7 @@ func divaRewardKeys(s *Session, event DivaEvent, rewardType uint8) ([]string, er
 		if err != nil || guildID == 0 {
 			return nil, err
 		}
-		rankings, err := s.server.divaRepo.GetInterceptionGuildRankings()
+		rankings, err := s.server.divaRepo.GetInterceptionGuildRankings(event.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -698,15 +705,20 @@ func divaRewardKeys(s *Session, event DivaEvent, rewardType uint8) ([]string, er
 		}
 		return []string{"interception-guild"}, nil
 	case 5: // interception treasure/achievement
-		points, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID)
+		points, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID, event.ID)
 		if err != nil {
 			return nil, err
 		}
-		for _, value := range points {
-			if value > 0 {
-				return []string{"interception"}, nil
+		keys := make([]string, 0, len(divaInterceptionBranchQuestIDs))
+		for _, questID := range divaInterceptionBranchQuestIDs {
+			if points[fmt.Sprint(questID)] >= int(divaInterceptionAreaPointRequirement) {
+				// Some installations reuse the same events row for another run.
+				// Include its start timestamp so a previous run's generic or branch
+				// claim cannot suppress the current treasure reward.
+				keys = append(keys, fmt.Sprintf("branch:%d:%d", questID, event.StartTime))
 			}
 		}
+		return keys, nil
 	}
 	return nil, nil
 }

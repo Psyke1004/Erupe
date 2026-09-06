@@ -578,6 +578,46 @@ func TestHandleMsgMhfAcquireUdItemDeliversUnifiedRewardOnce(t *testing.T) {
 	}
 }
 
+func TestHandleMsgMhfAcquireUdItemRequiresCompletedInterceptionBranch(t *testing.T) {
+	server := createMockServer()
+	repo := &mockDivaRepo{
+		events:             []DivaEvent{{ID: 8, StartTime: 12345}},
+		interceptionPoints: map[string]int{"58081": 999},
+		rewardClaims:       map[string]bool{"5:interception": true},
+	}
+	server.divaRepo = repo
+	session := createMockSession(1, server)
+	pkt := &mhfpacket.MsgMhfAcquireUdItem{
+		AckHandle: 1, RewardType: 5, ItemIDCount: 1,
+		ItemIDs: []uint32{uint32(divaRewardItemID)},
+	}
+
+	handleMsgMhfAcquireUdItem(session, pkt)
+	const dataOffset = 10
+	data := (<-session.sendPackets).data[dataOffset:]
+	if len(data) != 2 || data[1] != 0 {
+		t.Fatalf("incomplete branch claim payload=% X, want zero results", data)
+	}
+
+	repo.interceptionPoints["58081"] = int(divaInterceptionAreaPointRequirement)
+	pkt.AckHandle = 2
+	handleMsgMhfAcquireUdItem(session, pkt)
+	data = (<-session.sendPackets).data[dataOffset:]
+	if len(data) != 11 || data[1] != 1 {
+		t.Fatalf("completed branch claim payload=% X, want one result", data)
+	}
+	if !repo.rewardClaims["5:branch:58081:12345"] {
+		t.Fatal("completed branch did not use an event-run-specific reward key")
+	}
+
+	pkt.AckHandle = 3
+	handleMsgMhfAcquireUdItem(session, pkt)
+	data = (<-session.sendPackets).data[dataOffset:]
+	if len(data) != 2 || data[1] != 0 {
+		t.Fatalf("duplicate branch claim payload=% X, want zero results", data)
+	}
+}
+
 func TestHandleMsgMhfGetUdRanking(t *testing.T) {
 	tests := []struct {
 		mode        uint8

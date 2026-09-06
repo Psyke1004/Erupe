@@ -1,8 +1,8 @@
 package channelserver
 
 import (
-	"encoding/hex"
-	"fmt"
+	"sort"
+	"strconv"
 
 	"erupe-ce/common/byteframe"
 	"erupe-ce/common/stringsupport"
@@ -10,11 +10,81 @@ import (
 	"go.uber.org/zap"
 )
 
+const divaTacticsCompletedQuestLimit = 255
+
+func isDivaTacticsQuestID(questID uint16) bool {
+	for _, candidate := range divaInterceptionQuestIDs {
+		if questID == candidate {
+			return true
+		}
+	}
+	for _, candidate := range divaInterceptionBranchQuestIDs {
+		if questID == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func divaTacticsCompletedQuestIDs(pointsMap map[string]int) []uint16 {
+	questIDs := make([]uint16, 0, len(pointsMap))
+	for rawQuestID, points := range pointsMap {
+		if points <= 0 {
+			continue
+		}
+		questID, err := strconv.ParseUint(rawQuestID, 10, 16)
+		if err != nil || !isDivaTacticsQuestID(uint16(questID)) {
+			continue
+		}
+		questIDs = append(questIDs, uint16(questID))
+	}
+	sort.Slice(questIDs, func(i, j int) bool { return questIDs[i] < questIDs[j] })
+	if len(questIDs) > divaTacticsCompletedQuestLimit {
+		questIDs = questIDs[:divaTacticsCompletedQuestLimit]
+	}
+	return questIDs
+}
+
+func writeDivaTacticsCompletedQuestIDs(bf *byteframe.ByteFrame, questIDs []uint16) {
+	if len(questIDs) > divaTacticsCompletedQuestLimit {
+		questIDs = questIDs[:divaTacticsCompletedQuestLimit]
+	}
+	bf.WriteUint8(uint8(len(questIDs)))
+	for _, questID := range questIDs {
+		bf.WriteUint16(questID)
+	}
+}
+
+// divaTacticsPointTotal converts the persisted bigint-style point collection
+// to the client's u32 protocol field without allowing an overflow to wrap the
+// displayed total back to a smaller value.
+func divaTacticsPointTotal(pointsMap map[string]int) uint32 {
+	const maxTotal = ^uint32(0)
+	total := uint64(0)
+	for _, points := range pointsMap {
+		if points <= 0 {
+			continue
+		}
+		if uint64(points) >= uint64(maxTotal)-total {
+			return maxTotal
+		}
+		total += uint64(points)
+	}
+	return uint32(total)
+}
+
 func handleMsgMhfGetUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 	// Diva defense interception points
 	pkt := p.(*mhfpacket.MsgMhfGetUdTacticsPoint)
 
-	pointsMap, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID)
+	eventID, eventErr := getCurrentDivaEventID(s)
+	pointsMap := map[string]int{}
+	var err error
+	if eventErr == nil && eventID != 0 {
+		pointsMap, err = s.server.divaRepo.GetCharacterInterceptionPoints(s.charID, eventID)
+	} else if eventErr != nil {
+		err = eventErr
+	}
 	if err != nil {
 		s.logger.Warn("Failed to get interception points", zap.Uint32("charID", s.charID), zap.Error(err))
 		pointsMap = map[string]int{}
@@ -22,40 +92,26 @@ func handleMsgMhfGetUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 
 	// The ZZ client decoder for MSG_MHF_GET_UD_TACTICS_POINT expects:
 	//   status:u8, total:u32, entry_count:u8, entries:entry_count*u16
-	// The entries are optional map-detail values, not quest ID/point pairs.
+	// The entries are completed interception quest IDs, not quest ID/point
+	// pairs. The client scans this fixed list while calculating the first-clear
+	// point component; returning an empty list makes every repeat look like a
+	// first clear and can inflate both the displayed total and urgent progress.
 	// Returning the old u32 count followed by u32 pairs shifted the decoder and
 	// made a persisted total disappear (or display arbitrary values) after the
 	// result screen's locally calculated total was gone.
-	var total int
-	for _, pts := range pointsMap {
-		if pts <= 0 {
-			continue
-		}
-		total += pts
-	}
+	total := divaTacticsPointTotal(pointsMap)
 	s.logger.Debug("Retrieved Diva tactics points",
 		zap.Uint32("charID", s.charID),
-		zap.Int("total", total),
+		zap.Uint32("total", total),
 		zap.Int("storedQuestEntries", len(pointsMap)))
 
 	bf := byteframe.NewByteFrame()
 	bf.WriteUint8(0) // status: success
-	bf.WriteUint32(uint32(total))
-	bf.WriteUint8(0) // no optional map-detail values
+	bf.WriteUint32(total)
+	writeDivaTacticsCompletedQuestIDs(bf, divaTacticsCompletedQuestIDs(pointsMap))
 
 	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
-
-// udTacticsQuestMin/Max bound the interception (Diva Defense) quest file IDs.
-// Every ripped 58xxx quest_id in EventQuests.sql (quest_type 46/47/48, see
-// isDivaDefenseQuestType in constants_quest.go) falls in 58043-58128; the
-// previous 58079-58083 bound only covered one event batch out of 65 rows.
-// This range isn't gap-free (a handful of unused IDs in between are also
-// accepted), but that's harmless since no real quest ever sends them here.
-const (
-	udTacticsQuestMin = 58043
-	udTacticsQuestMax = 58128
-)
 
 func handleMsgMhfAddUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfAddUdTacticsPoint)
@@ -66,18 +122,21 @@ func handleMsgMhfAddUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 		zap.Int("questFileID", questFileID),
 		zap.Int("points", points))
 
-	if questFileID < udTacticsQuestMin || questFileID > udTacticsQuestMax {
-		s.logger.Warn("AddUdTacticsPoint: quest file ID out of range",
-			zap.Int("questFileID", questFileID),
-			zap.String("range", fmt.Sprintf("%d-%d", udTacticsQuestMin, udTacticsQuestMax)))
+	if !isDivaTacticsQuestID(pkt.QuestID) {
+		s.logger.Warn("AddUdTacticsPoint: unknown Diva quest file ID",
+			zap.Int("questFileID", questFileID))
 		// The client registered MSG_MHF_ADD_UD_TACTICS_POINT as a buffered
 		// response and decodes status:u8, detail_count:u8, then u16 details.
 		doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00})
 		return
 	}
 
+	eventID, eventErr := getCurrentDivaEventID(s)
 	if points > 0 {
-		if err := s.server.divaRepo.AddInterceptionPoints(s.charID, questFileID, points); err != nil {
+		if eventErr != nil || eventID == 0 {
+			s.logger.Warn("Ignored Diva tactics points without a current event",
+				zap.Uint32("charID", s.charID), zap.Error(eventErr))
+		} else if err := s.server.divaRepo.AddInterceptionPoints(s.charID, eventID, questFileID, points); err != nil {
 			s.logger.Warn("Failed to add interception points",
 				zap.Uint32("charID", s.charID),
 				zap.Int("questFileID", questFileID),
@@ -91,9 +150,22 @@ func handleMsgMhfAddUdTacticsPoint(s *Session, p mhfpacket.MHFPacket) {
 		}
 	}
 
-	// An empty successful detail list. A simple ACK here leaves the client's
-	// interception submission state unresolved even though the DB update ran.
-	doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00})
+	// ADD uses the same completed-quest array as GET, but without the total.
+	// Return the complete updated set because the decoder overwrites from slot
+	// zero and its consumers scan all 255 slots without retaining a count.
+	pointsMap := map[string]int{}
+	if eventErr == nil && eventID != 0 {
+		if storedPoints, err := s.server.divaRepo.GetCharacterInterceptionPoints(s.charID, eventID); err != nil {
+			s.logger.Warn("Failed to refresh completed Diva tactics quests",
+				zap.Uint32("charID", s.charID), zap.Error(err))
+		} else {
+			pointsMap = storedPoints
+		}
+	}
+	bf := byteframe.NewByteFrame()
+	bf.WriteUint8(0) // status: success
+	writeDivaTacticsCompletedQuestIDs(bf, divaTacticsCompletedQuestIDs(pointsMap))
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 const divaTacticsPrizeLimit = 512
@@ -167,11 +239,43 @@ func handleMsgMhfGetUdTacticsFollower(s *Session, p mhfpacket.MHFPacket) {
 	doAckBufSucceed(s, pkt.AckHandle, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 }
 
+const divaTacticsBonusQuestLimit = 32
+
+type divaTacticsBonusQuestEntry struct {
+	questID    uint16
+	startEpoch uint32
+	endEpoch   uint32
+	points     uint16
+}
+
+// writeDivaTacticsBonusQuestList emits the exact structure decoded by the ZZ
+// client: u8 count followed by 12-byte, big-endian schedule records. The client
+// owns 32 fixed internal slots, so never advertise more than that.
+func writeDivaTacticsBonusQuestList(bf *byteframe.ByteFrame, entries []divaTacticsBonusQuestEntry) {
+	if len(entries) > divaTacticsBonusQuestLimit {
+		entries = entries[:divaTacticsBonusQuestLimit]
+	}
+	bf.WriteUint8(uint8(len(entries)))
+	for _, entry := range entries {
+		bf.WriteUint16(entry.questID)
+		bf.WriteUint32(entry.startEpoch)
+		bf.WriteUint32(entry.endEpoch)
+		bf.WriteUint16(entry.points)
+	}
+}
+
 func handleMsgMhfGetUdTacticsBonusQuest(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdTacticsBonusQuest)
-	// Temporary canned response
-	data, _ := hex.DecodeString("14E2F55DCBFE505DCC1A7003E8E2C55DCC6ED05DCC8AF00258E2CE5DCCDF505DCCFB700279E3075DCD4FD05DCD6BF0041AE2F15DCDC0505DCDDC700258E2C45DCE30D05DCE4CF00258E2F55DCEA1505DCEBD7003E8E2C25DCF11D05DCF2DF00258E2CE5DCF82505DCF9E700279E3075DCFF2D05DD00EF0041AE2CE5DD063505DD07F700279E2F35DD0D3D05DD0EFF0028AE2C35DD144505DD160700258E2F05DD1B4D05DD1D0F00258E2CE5DD225505DD241700279E2F55DD295D05DD2B1F003E8E2F25DD306505DD3227002EEE2CA5DD376D05DD392F00258E3075DD3E7505DD40370041AE2F55DD457D05DD473F003E82027313220686F757273273A3A696E74657276616C29202B2027313220686F757273273A3A696E74657276616C2047524F5550204259206D6170204F52444552204259206D61703B2000C7312B000032")
-	doAckBufSucceed(s, pkt.AckHandle, data)
+	bf := byteframe.NewByteFrame()
+	// Opcode 0x185 is the time-limited Bonus Quest schedule shown in the
+	// top-right HUD panel. It is not the branch-route quest list. Branch quests
+	// are derived locally from the guild-map topology, so advertising one here
+	// creates a misleading Bonus Quest notice without making it selectable from
+	// the Branch Route menu. Until real bonus schedules are configured, return
+	// the client's valid zero-entry representation.
+	writeDivaTacticsBonusQuestList(bf, nil)
+	s.logger.Debug("No Diva tactics bonus quest configured", zap.Uint32("charID", s.charID))
+	doAckBufSucceed(s, pkt.AckHandle, bf.Data())
 }
 
 // udTacticsFirstQuestBonuses are the static first-quest bonus point values.
@@ -195,13 +299,18 @@ func handleMsgMhfGetUdTacticsRemainingPoint(s *Session, p mhfpacket.MHFPacket) {
 		guildID, _ = s.server.divaRepo.GetCharacterGuildID(s.charID)
 	}
 	var guildScore uint32
-	if guildID != 0 {
-		if rankings, err := s.server.divaRepo.GetInterceptionGuildRankings(); err == nil {
-			_, guildScore = findDivaRanking(rankings, guildID)
+	eventID, _ := getCurrentDivaEventID(s)
+	if guildID != 0 && eventID != 0 {
+		if score, err := s.server.divaRepo.GetInterceptionGuildMapScore(eventID, guildID); err == nil {
+			guildScore = score
 		}
 	}
 	remaining := uint32(0)
-	if guildScore < divaInterceptionAreaPointRequirement*divaInterceptionAreaCount {
+	if divaInterceptionAreaPointRequirement != 0 {
+		// The generated route is shorter than the 60-cell render grid. At route
+		// completion the terminal contact gauge deliberately keeps cycling, so
+		// the remaining-point response must use the same modulo rule rather than
+		// an unrelated 60,000-point board cap.
 		remaining = divaInterceptionAreaPointRequirement - guildScore%divaInterceptionAreaPointRequirement
 	}
 	bf := byteframe.NewByteFrame()
@@ -211,7 +320,14 @@ func handleMsgMhfGetUdTacticsRemainingPoint(s *Session, p mhfpacket.MHFPacket) {
 
 func handleMsgMhfGetUdTacticsRanking(s *Session, p mhfpacket.MHFPacket) {
 	pkt := p.(*mhfpacket.MsgMhfGetUdTacticsRanking)
-	rankings, err := s.server.divaRepo.GetInterceptionGuildRankings()
+	eventID, eventErr := getCurrentDivaEventID(s)
+	var rankings []DivaRankingEntry
+	var err error
+	if eventErr == nil && eventID != 0 {
+		rankings, err = s.server.divaRepo.GetInterceptionGuildRankings(eventID)
+	} else {
+		err = eventErr
+	}
 	if err != nil {
 		s.logger.Error("Failed to query Diva interception guild ranking", zap.Error(err))
 		rankings = nil

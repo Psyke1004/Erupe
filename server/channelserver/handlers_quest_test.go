@@ -234,6 +234,70 @@ func TestEnumerateQuestBasicStructure(t *testing.T) {
 	}
 }
 
+func TestDivaQuestFilesPreserveCategoryFlags(t *testing.T) {
+	server := createMockServer()
+	server.erupeConfig.RealClientMode = cfg.ZZ
+	server.erupeConfig.BinPath = filepath.Join("..", "..", "bin")
+	server.questCache = NewQuestCache(0)
+	session := createMockSession(1, server)
+
+	tests := []struct {
+		name       string
+		questID    int
+		questType  uint8
+		mark       uint32
+		wantZenith bool
+	}{
+		{name: "urgent Keoaruboru", questID: 58043, questType: QuestTypeDivaDefenseC, mark: 1},
+		{name: "branch route", questID: 58081, questType: QuestTypeDivaDefenseB},
+		{name: "Zenith interception", questID: 58102, questType: QuestTypeDivaDefenseA, mark: 1, wantZenith: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := makeEventQuest(session, EventQuest{
+				ID:         uint32(tt.questID),
+				MaxPlayers: 4,
+				QuestType:  tt.questType,
+				QuestID:    tt.questID,
+				Mark:       tt.mark,
+				Flags:      -1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data) <= questFrameVariant3Offset {
+				t.Fatalf("quest frame is too short: %d", len(data))
+			}
+			variant3 := data[questFrameVariant3Offset]
+			if variant3&0x20 == 0 {
+				t.Errorf("quest %d lost its interception flag: %02X", tt.questID, variant3)
+			}
+			if got := variant3&0x10 != 0; got != tt.wantZenith {
+				t.Errorf("quest %d Zenith flag=%v, want %v (variant3=%02X)",
+					tt.questID, got, tt.wantZenith, variant3)
+			}
+		})
+	}
+}
+
+func TestPrioritizeDivaEventQuests(t *testing.T) {
+	quests := []EventQuest{
+		{QuestID: 100, QuestType: 1},
+		{QuestID: 58043, QuestType: QuestTypeDivaDefenseC},
+		{QuestID: 200, QuestType: 2},
+		{QuestID: 58081, QuestType: QuestTypeDivaDefenseB},
+		{QuestID: 58102, QuestType: QuestTypeDivaDefenseA},
+		{QuestID: 300, QuestType: 3},
+	}
+	prioritizeDivaEventQuests(quests)
+	want := []int{58043, 58081, 58102, 100, 200, 300}
+	for i := range want {
+		if quests[i].QuestID != want[i] {
+			t.Fatalf("prioritized quest %d=%d, want %d", i, quests[i].QuestID, want[i])
+		}
+	}
+}
+
 // TestEnumerateQuestNextOffsetAdvances is a regression test for issue #194:
 // the response's offset field must be pkt.Offset+returnedCount (the offset
 // the client should request next), not pkt.Offset unchanged. Returning the

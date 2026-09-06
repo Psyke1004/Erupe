@@ -96,7 +96,7 @@ func TestRepoDivaGetAssignedBeadPersistsAfterLockExpiry(t *testing.T) {
 func TestRepoDivaAddBeadPointsStoresEventID(t *testing.T) {
 	repo, db := setupDivaRepo(t)
 	userID := CreateTestUser(t, db, "diva_bead_points_user")
-	charID := CreateTestCharacter(t, db, userID, "DivaBeadPointsChar")
+	charID := CreateTestCharacter(t, db, userID, "DivaBeadPoints")
 
 	var eventID uint32
 	if err := db.Get(&eventID, `
@@ -130,7 +130,7 @@ func TestRepoDivaAddBeadPointsStoresEventID(t *testing.T) {
 func TestRepoDivaAddPointSubmissionPreservesDailyComponents(t *testing.T) {
 	repo, db := setupDivaRepo(t)
 	userID := CreateTestUser(t, db, "diva_daily_points_user")
-	charID := CreateTestCharacter(t, db, userID, "DivaDailyPointsChar")
+	charID := CreateTestCharacter(t, db, userID, "DivaDailyPoints")
 
 	var eventID uint32
 	if err := db.Get(&eventID, `
@@ -159,6 +159,89 @@ func TestRepoDivaAddPointSubmissionPreservesDailyComponents(t *testing.T) {
 	}
 	if qp != 252 || bp != 120 {
 		t.Errorf("totals=%d/%d, want 252/120", qp, bp)
+	}
+}
+
+func TestRepoDivaInterceptionPointsAreEventScoped(t *testing.T) {
+	repo, db := setupDivaRepo(t)
+	firstUserID := CreateTestUser(t, db, "diva_interception_first_user")
+	firstCharID := CreateTestCharacter(t, db, firstUserID, "DivaIntFirst")
+	secondUserID := CreateTestUser(t, db, "diva_interception_second_user")
+	secondCharID := CreateTestCharacter(t, db, secondUserID, "DivaIntSecond")
+	guildID := CreateTestGuild(t, db, firstCharID, "DivaInterceptionGuild")
+	if _, err := db.Exec(
+		"INSERT INTO guild_characters (guild_id, character_id) VALUES ($1, $2)",
+		guildID,
+		secondCharID,
+	); err != nil {
+		t.Fatalf("add second guild member: %v", err)
+	}
+
+	insertEvent := func() uint32 {
+		t.Helper()
+		var eventID uint32
+		if err := db.Get(&eventID, `
+			INSERT INTO events (event_type, start_time)
+			VALUES ('diva', now())
+			RETURNING id`); err != nil {
+			t.Fatalf("create Diva event: %v", err)
+		}
+		return eventID
+	}
+	firstEventID := insertEvent()
+	secondEventID := insertEvent()
+
+	contributions := []struct {
+		characterID uint32
+		eventID     uint32
+		questID     int
+		points      int
+	}{
+		{firstCharID, firstEventID, 58050, 600},
+		{firstCharID, firstEventID, 58050, 400},
+		{firstCharID, firstEventID, 58081, 250},
+		{secondCharID, firstEventID, 58051, 500},
+		{firstCharID, secondEventID, 58050, 900},
+	}
+	for _, contribution := range contributions {
+		if err := repo.AddInterceptionPoints(
+			contribution.characterID,
+			contribution.eventID,
+			contribution.questID,
+			contribution.points,
+		); err != nil {
+			t.Fatalf("AddInterceptionPoints(%+v): %v", contribution, err)
+		}
+	}
+
+	firstPoints, err := repo.GetCharacterInterceptionPoints(firstCharID, firstEventID)
+	if err != nil {
+		t.Fatalf("GetCharacterInterceptionPoints(first event): %v", err)
+	}
+	if len(firstPoints) != 2 || firstPoints["58050"] != 1000 || firstPoints["58081"] != 250 {
+		t.Fatalf("first-event points=%v, want map[58050:1000 58081:250]", firstPoints)
+	}
+	secondPoints, err := repo.GetCharacterInterceptionPoints(firstCharID, secondEventID)
+	if err != nil {
+		t.Fatalf("GetCharacterInterceptionPoints(second event): %v", err)
+	}
+	if len(secondPoints) != 1 || secondPoints["58050"] != 900 {
+		t.Fatalf("second-event points=%v, want map[58050:900]", secondPoints)
+	}
+
+	mapScore, err := repo.GetInterceptionGuildMapScore(firstEventID, guildID)
+	if err != nil {
+		t.Fatalf("GetInterceptionGuildMapScore: %v", err)
+	}
+	if mapScore != 1500 {
+		t.Fatalf("guild map score=%d, want 1500 without branch points", mapScore)
+	}
+	rankings, err := repo.GetInterceptionGuildRankings(firstEventID)
+	if err != nil {
+		t.Fatalf("GetInterceptionGuildRankings: %v", err)
+	}
+	if len(rankings) != 1 || rankings[0].ID != guildID || rankings[0].Score != 1750 {
+		t.Fatalf("guild rankings=%+v, want guild %d with score 1750", rankings, guildID)
 	}
 }
 

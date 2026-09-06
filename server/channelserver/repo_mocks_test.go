@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -1180,6 +1181,12 @@ type mockDivaRepo struct {
 	characterGuildID          uint32
 	interceptionPoints        map[string]int
 	interceptionGuildRankings []DivaRankingEntry
+	interceptionGuildMapScore uint32
+	interceptionReadEventID   uint32
+	interceptionAddEventID    uint32
+	interceptionMapEventID    uint32
+	interceptionMapGuildID    uint32
+	interceptionRankEventID   uint32
 	rewardClaims              map[string]bool
 
 	beadPointCharacterID uint32
@@ -1316,11 +1323,25 @@ func (m *mockDivaRepo) GetTopBeadPerDay(_ uint32, _ time.Time, _ int) (int, erro
 func (m *mockDivaRepo) CleanupBeads() error                     { return nil }
 func (m *mockDivaRepo) GetPersonalPrizes() ([]DivaPrize, error) { return nil, nil }
 func (m *mockDivaRepo) GetGuildPrizes() ([]DivaPrize, error)    { return nil, nil }
-func (m *mockDivaRepo) GetCharacterInterceptionPoints(_ uint32) (map[string]int, error) {
+func (m *mockDivaRepo) GetCharacterInterceptionPoints(_, eventID uint32) (map[string]int, error) {
+	m.interceptionReadEventID = eventID
 	return m.interceptionPoints, nil
 }
-func (m *mockDivaRepo) AddInterceptionPoints(_ uint32, _ int, _ int) error { return nil }
-func (m *mockDivaRepo) GetInterceptionGuildRankings() ([]DivaRankingEntry, error) {
+func (m *mockDivaRepo) AddInterceptionPoints(_, eventID uint32, questID int, points int) error {
+	m.interceptionAddEventID = eventID
+	if m.interceptionPoints == nil {
+		m.interceptionPoints = make(map[string]int)
+	}
+	m.interceptionPoints[strconv.Itoa(questID)] += points
+	return nil
+}
+func (m *mockDivaRepo) GetInterceptionGuildMapScore(eventID, guildID uint32) (uint32, error) {
+	m.interceptionMapEventID = eventID
+	m.interceptionMapGuildID = guildID
+	return m.interceptionGuildMapScore, m.rankingErr
+}
+func (m *mockDivaRepo) GetInterceptionGuildRankings(eventID uint32) ([]DivaRankingEntry, error) {
+	m.interceptionRankEventID = eventID
 	return m.interceptionGuildRankings, m.rankingErr
 }
 

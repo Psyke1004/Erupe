@@ -329,11 +329,18 @@ func TestServerStartAndShutdown(t *testing.T) {
 	s.Unlock()
 }
 
-func TestServerStartWithInvalidPort(t *testing.T) {
+func TestServerStartWhenPortIsInUse(t *testing.T) {
+	occupied, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("reserve test port: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+	port := uint16(occupied.Addr().(*net.TCPAddr).Port)
+
 	logger := zap.NewNop()
 	erupeConfig := &cfg.Config{
 		Entrance: cfg.Entrance{
-			Port: 1,
+			Port: port,
 		},
 	}
 
@@ -343,10 +350,10 @@ func TestServerStartWithInvalidPort(t *testing.T) {
 	}
 
 	s := NewServer(cfg)
-	err := s.Start()
+	err = s.Start()
 	if err == nil {
 		s.Shutdown()
-		t.Error("Start() should fail with invalid port")
+		t.Error("Start() should fail when its port is already in use")
 	}
 }
 
